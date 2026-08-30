@@ -499,23 +499,34 @@ All settings are environment variables with defaults — see `.env.example`.
 | `MODEL_DEVICE` | `auto` | `auto` / `cuda` / `mps` / `cpu` |
 | `APP_MODE` | `real` | `demo` tags every result so its metrics can never be shown as a real fix |
 | `MAX_MAP_SIZE` | `8000` | Reference maps are downscaled to this long edge |
-| `TOP_K_CANDIDATES` | `5` | Candidates carried into verification |
-| `MAX_KEYPOINTS` | `2048` | Per-image feature budget |
+| `TOP_K_CANDIDATES` | `8` | Candidates carried into verification |
+| `MAX_KEYPOINTS` | `4096` | Per-image feature budget |
 | `MATCHER` | `lightglue` | `lightglue` or `sift` |
 | `TILE_SCALES` | `0.08…0.25` | Tile areas as a fraction of map area |
-| `TILE_OVERLAP` | `0.25` | Overlap between neighbouring tiles |
-| `MAX_TILES` | `600` | Tile budget; the grid is evenly subsampled beyond it |
-| `WORK_SIZE` | `640` | Long edge used for feature extraction |
-| `RANSAC_THRESHOLD` | `5.0` | Reprojection threshold in pixels |
+| `TILE_OVERLAP` | `0.35` | Overlap between neighbouring tiles |
+| `MAX_TILES` | `900` | Tile budget; the grid is evenly subsampled beyond it |
+| `WORK_SIZE` | `960` | Long edge used for feature extraction |
+| `RANSAC_THRESHOLD` | `7.5` | Reprojection threshold in pixels (scales with `WORK_SIZE`) |
 | `MIN_INLIERS` | `15` | Hard acceptance floor |
 | `MIN_INLIER_RATIO` | `0.18` | Hard acceptance floor |
-| `MAX_REPROJECTION_ERROR` | `8.0` | Hard acceptance ceiling |
+| `MAX_REPROJECTION_ERROR` | `12.0` | Hard acceptance ceiling (scales with `WORK_SIZE`) |
 | `MIN_SPATIAL_COVERAGE` | `0.25` | Hard acceptance floor |
 | `MATCH_CONFIDENCE` | `0.60` | `MATCH_FOUND` threshold |
 | `LOW_CONFIDENCE` | `0.40` | Below this becomes `NO_MATCH` |
 | `AMBIGUITY_GAP` | `0.06` | Margin below which two candidates tie |
-| `ROTATION_SEARCH` | `true` | Try 90/180/270° when upright fails |
+| `ROTATION_SEARCH` | `true` | Enable the rotation search at all |
+| `ROTATION_SEARCH_ALWAYS` | `true` | Evaluate all 4 orientations per candidate and keep the best, instead of only rotating when upright fails |
 | `GLOBAL_FALLBACK` | `true` | Whole-map attempt when all tiles fail |
+
+> **Tuned for accuracy over speed.** The defaults above trade processing time
+> for higher-confidence, better-verified matches: a larger keypoint budget and
+> working resolution genuinely increase inlier counts and spatial coverage
+> (rather than inflating the confidence score), a wider candidate shortlist
+> and denser tiling reduce the chance the true region is missed, and the
+> exhaustive rotation search stops a few degrees of heading offset from
+> understating an otherwise-correct candidate. If you need faster iteration
+> during development, lower `WORK_SIZE`, `MAX_KEYPOINTS` and
+> `TOP_K_CANDIDATES`, or set `ROTATION_SEARCH_ALWAYS=false`.
 
 Frontend: `VITE_API_BASE` (leave unset to use the dev proxy).
 

@@ -167,13 +167,54 @@ def evaluate_candidate(candidate_id: int, tile_id: int, similarity: float,
     )
 
 
-def finalize_scores(scores: List[CandidateScore]) -> List[CandidateScore]:
-    """Apply the ambiguity term, compute final confidence and rank."""
+def _same_place(id_a: int, id_b: int, positions: Dict[int, tuple],
+                same_place_px: float) -> bool:
+    """Whether two candidates' projected centres describe one physical spot."""
+    if same_place_px <= 0:
+        return False
+    pa, pb = positions.get(id_a), positions.get(id_b)
+    if pa is None or pb is None:
+        return False
+    return float(np.hypot(pa[0] - pb[0], pa[1] - pb[1])) <= same_place_px
+
+
+def _distinct_runner_up(candidate: CandidateScore, pool: List[CandidateScore],
+                        positions: Dict[int, tuple],
+                        same_place_px: float) -> Optional[CandidateScore]:
+    """
+    First entry in ``pool`` (already sorted by score, descending) whose
+    projected position is NOT the same physical location as ``candidate``.
+
+    Overlapping map tiles routinely produce two independently-strong
+    candidates for one true location; that agreement must not count as a
+    rival when measuring how uniquely identifiable the location is, in either
+    the confidence score's ambiguity term or the AMBIGUOUS/MATCH_FOUND
+    decision.
+    """
+    for other in pool:
+        if _same_place(candidate.candidate_id, other.candidate_id, positions, same_place_px):
+            continue
+        return other
+    return None
+
+
+def finalize_scores(scores: List[CandidateScore],
+                    positions: Optional[Dict[int, tuple]] = None,
+                    same_place_px: float = 0.0) -> List[CandidateScore]:
+    """
+    Apply the ambiguity term, compute final confidence and rank.
+
+    ``positions``/``same_place_px`` let the ambiguity term skip a runner-up
+    that is really the same location seen through an overlapping tile, so two
+    genuinely correct candidates never suppress each other's confidence.
+    """
     if not scores:
         return []
+    positions = positions or {}
     ordered = sorted(scores, key=lambda s: s.geometric_score, reverse=True)
     for i, s in enumerate(ordered):
-        runner_up = ordered[i + 1].geometric_score if i + 1 < len(ordered) else None
+        runner = _distinct_runner_up(s, ordered[i + 1:], positions, same_place_px)
+        runner_up = runner.geometric_score if runner else None
         s.components["ambiguity"] = ambiguity_score(s.geometric_score, runner_up)
         s.final_score = _clamp01(sum(WEIGHTS[k] * s.components.get(k, 0.0) for k in WEIGHTS))
         if not s.homography_valid:
@@ -221,23 +262,20 @@ def decide(scores: List[CandidateScore],
                 f"no-match threshold of {settings.low_confidence:.2f}.")
 
     # Ambiguity: a near-tie between two valid geometries that place the drone
-    # in genuinely different parts of the map.
+    # in genuinely different parts of the map. Gaps only grow further down a
+    # score-sorted list, so the first distinct-location runner-up is the only
+    # one that can possibly trigger this.
     positions = positions or {}
-    for runner in (s for s in valid if s.candidate_id != best.candidate_id):
+    others = [s for s in valid if s.candidate_id != best.candidate_id]
+    runner = _distinct_runner_up(best, others, positions, same_place_px)
+    if runner is not None:
         gap = best.final_score - runner.final_score
-        if gap >= settings.ambiguity_gap or runner.final_score < settings.low_confidence:
-            break
-        p_best = positions.get(best.candidate_id)
-        p_run = positions.get(runner.candidate_id)
-        if p_best is not None and p_run is not None and same_place_px > 0:
-            separation = float(np.hypot(p_best[0] - p_run[0], p_best[1] - p_run[1]))
-            if separation <= same_place_px:
-                continue          # overlapping tiles agreeing on one location
-        return (MatchStatus.AMBIGUOUS,
-                f"Candidates {best.tile_id} ({best.final_score:.0%}) and "
-                f"{runner.tile_id} ({runner.final_score:.0%}) score within "
-                f"{gap:.0%} of each other but place the drone in different "
-                "map regions - the scene is not uniquely identifiable.")
+        if gap < settings.ambiguity_gap and runner.final_score >= settings.low_confidence:
+            return (MatchStatus.AMBIGUOUS,
+                    f"Candidates {best.tile_id} ({best.final_score:.0%}) and "
+                    f"{runner.tile_id} ({runner.final_score:.0%}) score within "
+                    f"{gap:.0%} of each other but place the drone in different "
+                    "map regions - the scene is not uniquely identifiable.")
 
     if best.final_score >= settings.match_confidence:
         return (MatchStatus.MATCH_FOUND,

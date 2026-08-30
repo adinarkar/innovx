@@ -158,6 +158,40 @@ def _evaluate(query_img: np.ndarray, query_feats: FeatureSet,
     return hom, match
 
 
+def _best_rotation(work_img: np.ndarray, query_feats: FeatureSet, tile_img: np.ndarray,
+                   work_w: int, work_h: int) -> Tuple[hg.HomographyResult, MatchResult, int]:
+    """
+    Evaluate a candidate tile at every orientation the query might be in and
+    keep the strongest verified result (spec section 50).
+
+    Trying every rotation - not only when the upright attempt fails - avoids
+    understating a genuinely correct candidate whose true confidence is
+    limited by a few degrees of heading offset rather than a wrong location.
+    Ranked by (passed verification, inlier count) so a valid geometry always
+    beats an invalid one regardless of raw inlier counts.
+    """
+    hom0, match0 = _evaluate(work_img, query_feats, tile_img, rotation=0)
+    attempts = [(0, hom0, match0)]
+
+    if settings.rotation_search:
+        run_all = settings.rotation_search_always
+        needs_search = run_all or not (hom0.ok and hom0.plausible)
+        if needs_search:
+            for k in (1, 2, 3):
+                rot_img = rotate_image(work_img, k)
+                rot_feats = extract_features(rot_img)
+                cand_hom, cand_match = _evaluate(rot_img, rot_feats, tile_img, rotation=k,
+                                                 canonical_size=(work_w, work_h))
+                attempts.append((k, cand_hom, cand_match))
+
+    def rank(attempt):
+        _, hom, _ = attempt
+        return (1 if (hom.ok and hom.plausible) else 0, hom.inliers)
+
+    rotation_used, hom, match = max(attempts, key=rank)
+    return hom, match, rotation_used
+
+
 # --------------------------------------------------------------------------
 def localize(record: MapRecord, drone_path: Path, job_dir: Path,
              calibration: Optional[CameraCalibration] = None,
@@ -236,21 +270,8 @@ def localize(record: MapRecord, drone_path: Path, job_dir: Path,
             continue
         tile_img, tile_scale = _prepare_work_image(crop)
 
-        hom, match = _evaluate(work_img, query_feats, tile_img, rotation=0)
-        rotation_used = 0
-
-        # Rotation search: only when the upright attempt is weak, so a strong
-        # match is never disturbed (spec section 50).
-        if settings.rotation_search and not (hom.ok and hom.plausible):
-            for k in (1, 2, 3):
-                rot_img = rotate_image(work_img, k)
-                rot_feats = extract_features(rot_img)
-                cand_hom, cand_match = _evaluate(rot_img, rot_feats, tile_img,
-                                                 rotation=k,
-                                                 canonical_size=(work_w, work_h))
-                if cand_hom.ok and cand_hom.plausible and cand_hom.inliers > hom.inliers:
-                    hom, match, rotation_used = cand_hom, cand_match, k
-                    break
+        hom, match, rotation_used = _best_rotation(work_img, query_feats, tile_img,
+                                                   work_w, work_h)
 
         score = evaluate_candidate(cand_idx + 1, tile.tile_id, hit["similarity"],
                                    hom, rotation_used)
@@ -281,15 +302,15 @@ def localize(record: MapRecord, drone_path: Path, job_dir: Path,
             log.info("Global fallback recovered a match with %d inliers.",
                      fallback.hom.inliers)
 
-    scores = finalize_scores([e.score for e in evaluations])
     by_id = {e.score.candidate_id: e for e in evaluations}
 
-    # Overlapping tiles routinely describe the same place; give the decision
-    # logic the projected centres so it can tell a true ambiguity from a
-    # duplicate detection.
+    # Overlapping tiles routinely describe the same place; give both the
+    # confidence engine and the decision logic the projected centres so
+    # neither penalises two candidates for genuinely agreeing.
     positions = {e.score.candidate_id: (float(e.center[0]), float(e.center[1]))
                  for e in evaluations if e.center is not None}
     same_place_px = _same_place_radius(evaluations, dw, dh)
+    scores = finalize_scores([e.score for e in evaluations], positions, same_place_px)
     status, explanation = decide(scores, positions, same_place_px)
     timings["verify"] = time.time() - t0
     stage("verify", STAGES[6][1], "done", explanation)

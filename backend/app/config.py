@@ -40,22 +40,32 @@ class Settings(BaseSettings):
     dino_model: str = "dinov2_vits14"
 
     # --- map handling ---
+    # Denser tiling (more overlap, more tiles) means whichever window the
+    # drone frame lands in is geometrically closer to its true field of view,
+    # which directly improves inlier counts and reprojection error downstream.
     max_map_size: int = 8000
-    tile_overlap: float = 0.25
+    tile_overlap: float = 0.35
     tile_scales_raw: str = "0.08,0.10,0.12,0.15,0.18,0.20,0.25"
-    max_tiles: int = 600
-    work_size: int = 640            # long edge used for feature extraction
+    max_tiles: int = 900
+    work_size: int = 960             # long edge used for feature extraction
 
     # --- retrieval / matching ---
-    top_k_candidates: int = 5
-    max_keypoints: int = 2048
+    # A wider shortlist and a larger keypoint budget cost more time per
+    # request but genuinely raise inlier counts and spatial coverage rather
+    # than inflating the confidence score artificially.
+    top_k_candidates: int = 8
+    max_keypoints: int = 4096
     matcher: str = "lightglue"      # lightglue | sift
 
     # --- geometric verification ---
-    ransac_threshold: float = 5.0
+    # Thresholds expressed in pixels scale with work_size (they are measured
+    # on the working-resolution image), so they are kept at the same ratio
+    # as the original 640px baseline (5.0/640 and 8.0/640) when work_size
+    # changes, rather than left stale at the old pixel scale.
+    ransac_threshold: float = 7.5
     min_inliers: int = 15
     min_inlier_ratio: float = 0.18
-    max_reprojection_error: float = 8.0
+    max_reprojection_error: float = 12.0
     min_spatial_coverage: float = 0.25
     coverage_grid: int = 4          # 4x4 grid, see spec section 18
 
@@ -66,6 +76,12 @@ class Settings(BaseSettings):
 
     # --- search strategy ---
     rotation_search: bool = True
+    # Evaluate all four orientations for every shortlisted candidate and keep
+    # whichever produces the strongest verified geometry, instead of only
+    # trying alternate rotations when the upright attempt already failed.
+    # Slower, but it stops a slightly-off rotation from understating a
+    # genuinely correct candidate's confidence.
+    rotation_search_always: bool = True
     global_fallback: bool = True
 
     # --- storage ---
