@@ -6,12 +6,29 @@ No single metric decides anything.  Every candidate gets a decomposed score
 whose parts are visible in the UI, and the final status is derived from the
 winner's score *and* its margin over the runner-up, so the system is allowed
 to answer NO_MATCH or AMBIGUOUS instead of always naming a best tile.
+
+The overlapping tiles used for retrieval (spec section 7) mean the true
+location routinely produces *several* independently-verified candidates
+rather than one.  Scoring those candidates individually and then comparing
+the top two treats that agreement as a threat ("these two are suspiciously
+close"), when it is actually the strongest evidence available.  This module
+therefore works in two layers:
+
+    per-tile diagnostics  -> CandidateScore   (unchanged, for the UI)
+    per-location decision -> ClusterScore     (drives status + confidence)
+
+Candidates are grouped by the physical map location they project to
+(:func:`cluster_candidates`), and the location with the strongest *combined*
+evidence - not the single best tile - is what the pipeline reports.  A
+location corroborated by several overlapping tiles scores higher than one
+supported by a single tile, which is exactly the additional signal a lone
+tile score is blind to.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -29,14 +46,26 @@ class MatchStatus(str, Enum):
     NO_MATCH = "NO_MATCH"
 
 
-# Weights of the confidence components.  They sum to 1.0 so the result is a
-# genuine 0..1 quantity rather than an arbitrary total.
+# Weights of the per-tile diagnostic score.  They sum to 1.0 so the result is
+# a genuine 0..1 quantity rather than an arbitrary total.
 WEIGHTS: Dict[str, float] = {
     "retrieval": 0.15,     # DINOv2 / classical similarity
     "inliers": 0.30,       # absolute RANSAC support
     "geometry": 0.25,      # reprojection error + homography plausibility
     "coverage": 0.15,      # spatial spread of inliers
     "ambiguity": 0.15,     # margin over the runner-up candidate
+}
+
+# Weights of the location-level score that actually drives the verdict.
+# "consensus" is new here: it rewards a location being independently
+# corroborated by more than one overlapping tile.
+CLUSTER_WEIGHTS: Dict[str, float] = {
+    "retrieval": 0.12,
+    "inliers": 0.28,
+    "geometry": 0.20,
+    "coverage": 0.12,
+    "consensus": 0.18,     # more supporting tiles for one location = stronger evidence
+    "ambiguity": 0.10,     # margin over the nearest *distinct* location
 }
 
 
@@ -61,29 +90,42 @@ def retrieval_score(similarity: float) -> float:
     return _clamp01((float(similarity) - 0.30) / 0.60)
 
 
-def inlier_score(hom: HomographyResult) -> float:
-    """Blend absolute inlier count with inlier ratio."""
-    count_part = _saturating(hom.inliers, half=45.0)
-    ratio_part = _clamp01(hom.inlier_ratio / 0.60)
+def inlier_score(inliers: int, inlier_ratio: float) -> float:
+    """
+    Blend absolute inlier count with inlier ratio.
+
+    Takes raw numbers rather than a :class:`HomographyResult` so the same
+    formula scores both a single tile and a location's *combined* evidence
+    (summed inliers across every tile that corroborates it).
+    """
+    count_part = _saturating(inliers, half=45.0)
+    ratio_part = _clamp01(inlier_ratio / 0.60)
     return _clamp01(0.6 * count_part + 0.4 * ratio_part)
 
 
-def geometry_score(hom: HomographyResult) -> float:
+def geometry_score(reprojection_error: Optional[float], shear: float, valid: bool) -> float:
     """Reprojection accuracy, zeroed when the homography is implausible."""
-    if not hom.ok or not hom.plausible:
-        return 0.0
-    err = hom.reprojection_error
-    if not np.isfinite(err):
+    if not valid or reprojection_error is None or not np.isfinite(reprojection_error):
         return 0.0
     # Exponential decay: at the configured max error the score is ~0.37.
-    accuracy = float(np.exp(-err / max(settings.max_reprojection_error, 1e-6)))
-    shear_penalty = _clamp01(1.0 - hom.shear / 0.7)
+    accuracy = float(np.exp(-reprojection_error / max(settings.max_reprojection_error, 1e-6)))
+    shear_penalty = _clamp01(1.0 - shear / 0.7)
     return _clamp01(0.75 * accuracy + 0.25 * shear_penalty)
 
 
-def coverage_score(hom: HomographyResult) -> float:
+def coverage_score(spatial_coverage: float) -> float:
     """Full credit once inliers touch ~60% of the grid cells."""
-    return _clamp01(hom.spatial_coverage / 0.60)
+    return _clamp01(spatial_coverage / 0.60)
+
+
+def consensus_score(support: int) -> float:
+    """
+    Reward a location being independently corroborated by more than one
+    overlapping tile.  Zero for a single supporting tile (no corroboration
+    to speak of); a saturating curve beyond that so a fourth or fifth
+    agreeing tile adds progressively less than the second did.
+    """
+    return _saturating(max(0, support - 1), half=1.0)
 
 
 def ambiguity_score(best_geo: float, runner_up_geo: Optional[float]) -> float:
@@ -112,6 +154,7 @@ class CandidateScore:
     homography_valid: bool = False
     rejection: Optional[str] = None
     rotation_applied: int = 0
+    shear: float = 0.0
     components: Dict[str, float] = field(default_factory=dict)
     geometric_score: float = 0.0
     final_score: float = 0.0
@@ -143,26 +186,26 @@ def evaluate_candidate(candidate_id: int, tile_id: int, similarity: float,
     Score one candidate *without* the ambiguity term - that needs the whole
     ranked field and is applied afterwards by :func:`finalize_scores`.
     """
+    valid = bool(hom.ok and hom.plausible)
+    err = float(hom.reprojection_error) if np.isfinite(hom.reprojection_error) else None
     comp = {
         "retrieval": retrieval_score(similarity),
-        "inliers": inlier_score(hom),
-        "geometry": geometry_score(hom),
-        "coverage": coverage_score(hom),
+        "inliers": inlier_score(hom.inliers, hom.inlier_ratio),
+        "geometry": geometry_score(err, hom.shear, valid),
+        "coverage": coverage_score(hom.spatial_coverage),
     }
     # Geometric score = the purely verification-driven part, used for ranking
     # and for measuring ambiguity between candidates.
     geo = (0.45 * comp["inliers"] + 0.35 * comp["geometry"] + 0.20 * comp["coverage"])
-    if not (hom.ok and hom.plausible):
+    if not valid:
         geo *= 0.25          # keep the ordering informative, kill the credit
 
     return CandidateScore(
         candidate_id=candidate_id, tile_id=tile_id, dino_similarity=float(similarity),
         raw_matches=hom.raw_matches, inliers=hom.inliers, inlier_ratio=hom.inlier_ratio,
-        spatial_coverage=hom.spatial_coverage,
-        reprojection_error=(float(hom.reprojection_error)
-                            if np.isfinite(hom.reprojection_error) else None),
-        homography_valid=bool(hom.ok and hom.plausible), rejection=hom.rejection,
-        rotation_applied=rotation_applied, components=comp,
+        spatial_coverage=hom.spatial_coverage, reprojection_error=err,
+        homography_valid=valid, rejection=hom.rejection,
+        rotation_applied=rotation_applied, shear=float(hom.shear), components=comp,
         geometric_score=_clamp01(geo),
     )
 
@@ -227,19 +270,184 @@ def finalize_scores(scores: List[CandidateScore],
     return ordered
 
 
-def decide(scores: List[CandidateScore],
-           positions: Optional[Dict[int, tuple]] = None,
-           same_place_px: float = 0.0) -> tuple[MatchStatus, str]:
+@dataclass
+class ClusterScore:
     """
-    Turn the ranked field into a status plus a human-readable explanation.
+    Aggregated evidence for one physical map location, built from every
+    candidate tile whose projection points there (spec: decide from
+    differentiated parts of the map, not from raw overlapping tiles).
+    """
+    cluster_id: int
+    tile_id: int                          # representative tile, for display
+    representative_id: int                # candidate_id of that representative
+    member_candidate_ids: List[int]
+    support: int                          # member tiles with a valid homography
+    total_members: int
+    dino_similarity: float = 0.0
+    raw_matches: int = 0                  # summed across supporting tiles
+    inliers: int = 0                      # summed across supporting tiles
+    inlier_ratio: float = 0.0
+    spatial_coverage: float = 0.0         # best observed among supporting tiles
+    reprojection_error: Optional[float] = None   # inlier-weighted average
+    homography_valid: bool = False
+    rejection: Optional[str] = None
+    rank: int = 0
+    components: Dict[str, float] = field(default_factory=dict)
+    geometric_score: float = 0.0
+    final_score: float = 0.0
+
+    def to_dict(self) -> dict:
+        return {
+            "cluster_id": self.cluster_id,
+            "tile_id": self.tile_id,
+            "rank": self.rank,
+            "member_tile_count": self.total_members,
+            "support": self.support,
+            "member_candidate_ids": list(self.member_candidate_ids),
+            "dino_similarity": round(float(self.dino_similarity), 4),
+            "raw_matches": int(self.raw_matches),
+            "inliers": int(self.inliers),
+            "inlier_ratio": round(float(self.inlier_ratio), 4),
+            "spatial_coverage": round(float(self.spatial_coverage), 4),
+            "reprojection_error": (round(float(self.reprojection_error), 3)
+                                   if self.reprojection_error is not None else None),
+            "homography_valid": bool(self.homography_valid),
+            "rejection": self.rejection,
+            "geometric_score": round(float(self.geometric_score), 4),
+            "final_score": round(float(self.final_score), 4),
+            "components": {k: round(float(v), 4) for k, v in self.components.items()},
+        }
+
+
+def cluster_candidates(scores: List[CandidateScore], positions: Dict[int, tuple],
+                       same_place_px: float) -> List[List[CandidateScore]]:
+    """
+    Group candidates by the physical map location they project to.
+
+    Greedy nearest-centroid assignment, seeded by the strongest evidence
+    first: each candidate joins the nearest existing cluster if its projected
+    centre is within ``same_place_px`` of that cluster's running centroid,
+    otherwise it starts a new one. Candidates with no projected position
+    (too few matches to attempt a homography) each form their own singleton
+    cluster - they carry no locational evidence to merge on.
+    """
+    ordered = sorted(scores, key=lambda s: s.geometric_score, reverse=True)
+    clusters: List[dict] = []
+    singletons: List[CandidateScore] = []
+
+    for s in ordered:
+        pos = positions.get(s.candidate_id)
+        if pos is None:
+            singletons.append(s)
+            continue
+        best_cluster, best_dist = None, None
+        for c in clusters:
+            d = float(np.hypot(pos[0] - c["centroid"][0], pos[1] - c["centroid"][1]))
+            if d <= same_place_px and (best_dist is None or d < best_dist):
+                best_cluster, best_dist = c, d
+        if best_cluster is not None:
+            best_cluster["members"].append(s)
+            n = len(best_cluster["members"])
+            sx = best_cluster["sum_x"] + pos[0]
+            sy = best_cluster["sum_y"] + pos[1]
+            best_cluster["sum_x"], best_cluster["sum_y"] = sx, sy
+            best_cluster["centroid"] = (sx / n, sy / n)
+        else:
+            clusters.append({"members": [s], "sum_x": pos[0], "sum_y": pos[1],
+                             "centroid": pos})
+
+    groups = [c["members"] for c in clusters] + [[s] for s in singletons]
+    return groups
+
+
+def score_clusters(clusters: List[List[CandidateScore]]) -> List[ClusterScore]:
+    """
+    Turn each location cluster into a :class:`ClusterScore` using its
+    *combined* evidence, then rank by final confidence.
+
+    Inliers and raw matches are summed across every supporting tile - each
+    overlapping tile is an independent look at the same ground truth, so more
+    of them agreeing is itself additional evidence, captured by the
+    ``consensus`` component. A location with one 150-inlier tile and a
+    location with three tiles totalling 400 inliers are not equally certain.
+    """
+    if not clusters:
+        return []
+
+    raw: List[ClusterScore] = []
+    for idx, members in enumerate(clusters):
+        valid = [m for m in members if m.homography_valid]
+        representative = max(valid or members, key=lambda m: m.final_score or m.geometric_score)
+        support = len(valid)
+
+        if valid:
+            raw_matches = sum(m.raw_matches for m in valid)
+            inliers = sum(m.inliers for m in valid)
+            inlier_ratio = inliers / max(raw_matches, 1)
+            spatial_coverage = max(m.spatial_coverage for m in valid)
+            weighted = [(m.reprojection_error, m.inliers) for m in valid
+                       if m.reprojection_error is not None]
+            total_w = sum(w for _, w in weighted)
+            reprojection_error = (sum(e * w for e, w in weighted) / total_w
+                                  if total_w > 0 else None)
+            homography_valid, rejection = True, None
+        else:
+            raw_matches = max((m.raw_matches for m in members), default=0)
+            inliers, inlier_ratio, reprojection_error = 0, 0.0, None
+            spatial_coverage = max((m.spatial_coverage for m in members), default=0.0)
+            homography_valid, rejection = False, representative.rejection
+
+        dino_similarity = max(m.dino_similarity for m in members)
+        comp = {
+            "retrieval": retrieval_score(dino_similarity),
+            "inliers": inlier_score(inliers, inlier_ratio),
+            "geometry": geometry_score(reprojection_error, representative.shear, homography_valid),
+            "coverage": coverage_score(spatial_coverage),
+            "consensus": consensus_score(support),
+        }
+        geo = (0.38 * comp["inliers"] + 0.28 * comp["geometry"]
+              + 0.14 * comp["coverage"] + 0.20 * comp["consensus"])
+        if not homography_valid:
+            geo *= 0.25
+
+        raw.append(ClusterScore(
+            cluster_id=idx, tile_id=representative.tile_id,
+            representative_id=representative.candidate_id,
+            member_candidate_ids=[m.candidate_id for m in members],
+            support=support, total_members=len(members),
+            dino_similarity=dino_similarity, raw_matches=raw_matches, inliers=inliers,
+            inlier_ratio=inlier_ratio, spatial_coverage=spatial_coverage,
+            reprojection_error=reprojection_error, homography_valid=homography_valid,
+            rejection=rejection, components=comp, geometric_score=_clamp01(geo),
+        ))
+
+    # Clusters are already spatially distinct by construction, so the
+    # immediate neighbour in score order is always a genuine rival location -
+    # no same-place exception needed here, unlike the per-tile score above.
+    ordered = sorted(raw, key=lambda c: c.geometric_score, reverse=True)
+    for i, c in enumerate(ordered):
+        runner_geo = ordered[i + 1].geometric_score if i + 1 < len(ordered) else None
+        c.components["ambiguity"] = ambiguity_score(c.geometric_score, runner_geo)
+        c.final_score = _clamp01(sum(CLUSTER_WEIGHTS[k] * c.components.get(k, 0.0)
+                                     for k in CLUSTER_WEIGHTS))
+        if not c.homography_valid:
+            c.final_score = min(c.final_score, 0.35)
+
+    ordered = sorted(ordered, key=lambda c: c.final_score, reverse=True)
+    for rank, c in enumerate(ordered, start=1):
+        c.rank = rank
+    return ordered
+
+
+def decide(scores: List[ClusterScore]) -> tuple[MatchStatus, str]:
+    """
+    Turn the ranked locations into a status plus a human-readable explanation.
 
     The order of the checks matters: structural failure (no valid homography)
-    outranks ambiguity, which outranks a merely low score.
-
-    ``positions`` maps candidate ids to their projected map centre.  Tiles
-    overlap by design, so the same physical location routinely appears as two
-    strong candidates; a near-tie only means AMBIGUOUS when the two candidates
-    also disagree about *where* the drone is, by more than ``same_place_px``.
+    outranks ambiguity, which outranks a merely low score. Unlike the old
+    per-tile version, no same-place exception is needed - clustering has
+    already merged overlapping tiles that agree, so any runner-up here is a
+    genuinely different part of the map.
     """
     if not scores:
         return MatchStatus.NO_MATCH, "No candidate regions could be evaluated."
@@ -258,34 +466,31 @@ def decide(scores: List[CandidateScore],
 
     if best.final_score < settings.low_confidence:
         return (MatchStatus.NO_MATCH,
-                f"Best verified candidate scored {best.final_score:.2f}, below the "
+                f"Best verified location scored {best.final_score:.2f}, below the "
                 f"no-match threshold of {settings.low_confidence:.2f}.")
 
-    # Ambiguity: a near-tie between two valid geometries that place the drone
-    # in genuinely different parts of the map. Gaps only grow further down a
-    # score-sorted list, so the first distinct-location runner-up is the only
-    # one that can possibly trigger this.
-    positions = positions or {}
-    others = [s for s in valid if s.candidate_id != best.candidate_id]
-    runner = _distinct_runner_up(best, others, positions, same_place_px)
-    if runner is not None:
+    others = [s for s in valid if s.cluster_id != best.cluster_id]
+    if others:
+        runner = others[0]
         gap = best.final_score - runner.final_score
         if gap < settings.ambiguity_gap and runner.final_score >= settings.low_confidence:
             return (MatchStatus.AMBIGUOUS,
-                    f"Candidates {best.tile_id} ({best.final_score:.0%}) and "
-                    f"{runner.tile_id} ({runner.final_score:.0%}) score within "
-                    f"{gap:.0%} of each other but place the drone in different "
-                    "map regions - the scene is not uniquely identifiable.")
+                    f"A region near tile {best.tile_id} ({best.final_score:.0%}) and a "
+                    f"separate region near tile {runner.tile_id} ({runner.final_score:.0%}) "
+                    f"score within {gap:.0%} of each other - the scene is not uniquely "
+                    "identifiable.")
 
+    support_note = f", corroborated by {best.support} overlapping tiles" if best.support > 1 else ""
     if best.final_score >= settings.match_confidence:
         return (MatchStatus.MATCH_FOUND,
-                f"Verified with {best.inliers} RANSAC inliers "
-                f"({best.inlier_ratio:.0%} of {best.raw_matches} matches) and "
-                f"{best.spatial_coverage:.0%} spatial coverage.")
+                f"Verified with {best.inliers} combined RANSAC inliers "
+                f"({best.inlier_ratio:.0%} of {best.raw_matches} matches){support_note} "
+                f"and {best.spatial_coverage:.0%} spatial coverage.")
 
     return (MatchStatus.LOW_CONFIDENCE,
-            f"A geometrically valid match exists at {best.final_score:.0%} confidence, "
-            "below the reporting threshold. Treat the position as indicative only.")
+            f"A geometrically valid match exists at {best.final_score:.0%} confidence"
+            f"{support_note}, below the reporting threshold. Treat the position as "
+            "indicative only.")
 
 
 def status_message(status: MatchStatus) -> str:

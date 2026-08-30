@@ -11,6 +11,9 @@ export default function CandidateCard({ candidate, selected, onSelect }) {
   const c = candidate
   const preview = fileUrl(c.preview_url)
   const isBest = c.rank === 1
+  // A tile can rank below #1 individually yet still belong to the winning
+  // location cluster - it corroborated candidate #1 rather than rivalling it.
+  const isCorroborating = !isBest && c.cluster_rank === 1
 
   return (
     <button
@@ -43,6 +46,7 @@ export default function CandidateCard({ candidate, selected, onSelect }) {
               {c.source === 'global' ? 'Whole-map fallback' : `Tile ${c.tile_id}`}
             </span>
             {isBest && <Chip tone="brand">SELECTED</Chip>}
+            {isCorroborating && <Chip tone="ok">SAME LOCATION AS #1</Chip>}
             <span className="ml-auto">
               <BoolBadge value={c.homography_valid} />
             </span>
@@ -55,6 +59,11 @@ export default function CandidateCard({ candidate, selected, onSelect }) {
             <Stat label="Reproj." value={c.reprojection_error === null ? '--' : px(c.reprojection_error)} />
           </div>
 
+          {isCorroborating && (
+            <p className="mt-2 text-[11.5px] text-state-ok">
+              Overlaps candidate #1's location - counted as corroborating evidence, not a rival.
+            </p>
+          )}
           {c.rejection && (
             <p className="mt-2 text-[11.5px] text-state-bad">
               Rejected: {rejectionLabel(c.rejection)}

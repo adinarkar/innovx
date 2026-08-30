@@ -25,9 +25,9 @@ from app.config import settings
 from app.logging_config import get_logger
 from app.localization import dino, homography as hg, visualization as viz
 from app.localization.imaging import fit_long_edge, imread
-from app.localization.confidence import (CandidateScore, MatchStatus, decide,
-                                         evaluate_candidate, finalize_scores,
-                                         status_message)
+from app.localization.confidence import (CandidateScore, ClusterScore, MatchStatus,
+                                         cluster_candidates, decide, evaluate_candidate,
+                                         finalize_scores, score_clusters, status_message)
 from app.localization.lightglue import (MatchResult, extract_features, match_features,
                                         rotate_image, unrotate_points)
 from app.localization.preprocessing import (CameraCalibration, PreprocessResult,
@@ -304,29 +304,47 @@ def localize(record: MapRecord, drone_path: Path, job_dir: Path,
 
     by_id = {e.score.candidate_id: e for e in evaluations}
 
-    # Overlapping tiles routinely describe the same place; give both the
-    # confidence engine and the decision logic the projected centres so
-    # neither penalises two candidates for genuinely agreeing.
+    # Overlapping tiles routinely describe the same place. Rather than score
+    # tiles individually and then worry two of them are "too close", group
+    # them by the map location they actually project to and let the location
+    # with the strongest *combined* evidence win (spec: decide from
+    # differentiated parts of the map, not from raw overlapping tiles).
     positions = {e.score.candidate_id: (float(e.center[0]), float(e.center[1]))
                  for e in evaluations if e.center is not None}
     same_place_px = _same_place_radius(evaluations, dw, dh)
-    scores = finalize_scores([e.score for e in evaluations], positions, same_place_px)
-    status, explanation = decide(scores, positions, same_place_px)
+
+    # Per-tile diagnostics for the Candidate Analysis UI - unaffected by
+    # clustering, still ranks every individual tile on its own merits.
+    diagnostic_scores = finalize_scores([e.score for e in evaluations], positions, same_place_px)
+
+    clusters = cluster_candidates([e.score for e in evaluations], positions, same_place_px)
+    cluster_scores = score_clusters(clusters)
+    status, explanation = decide(cluster_scores)
     timings["verify"] = time.time() - t0
     stage("verify", STAGES[6][1], "done", explanation)
 
     # ---- 9. position + renders ------------------------------------------
     stage(*STAGES[7])
     t0 = time.time()
-    best_score = next((s for s in scores if s.homography_valid), scores[0] if scores else None)
-    best = by_id.get(best_score.candidate_id) if best_score else None
+    best_cluster = next((c for c in cluster_scores if c.homography_valid),
+                        cluster_scores[0] if cluster_scores else None)
+    best = by_id.get(best_cluster.representative_id) if best_cluster else None
     accepted = status in (MatchStatus.MATCH_FOUND, MatchStatus.LOW_CONFIDENCE)
 
+    # The reported position and outline are a confidence-weighted average
+    # across every tile supporting the winning location, not just the single
+    # best tile - corroborating tiles refine the estimate as well as the score.
+    agg_center, agg_polygon = (
+        _aggregate_geometry(best_cluster.member_candidate_ids, by_id)
+        if best_cluster is not None else (None, None))
+
     renders = _render_all(job_dir, record, map_img, drone_img, pre, work_img,
-                          query_feats, evaluations, best, accepted)
-    result = _build_result(record, status, explanation, best, best_score, scores,
+                          query_feats, evaluations, best, accepted,
+                          agg_polygon, agg_center)
+    result = _build_result(record, status, explanation, best, best_cluster, diagnostic_scores,
                            evaluations, renders, drone_img, pre, query_feats,
-                           map_w, map_h, timings, t_start, engine)
+                           map_w, map_h, timings, t_start, engine,
+                           agg_center, agg_polygon, cluster_scores)
     timings["position"] = time.time() - t0
     stage("position", STAGES[7][1], "done", status_message(status))
     result["timings"] = {k: round(v, 3) for k, v in timings.items()}
@@ -380,6 +398,36 @@ def _same_place_radius(evaluations: List["CandidateEvaluation"],
     return float(np.hypot(dw, dh)) / 3.0
 
 
+def _aggregate_geometry(member_candidate_ids: List[int],
+                        by_id: Dict[int, "CandidateEvaluation"]
+                        ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    """
+    Confidence-weighted average of the centre and outline across every tile
+    that supports the winning location.
+
+    Each overlapping tile solves its own homography independently, so its
+    centre/corner estimates carry independent noise; weighting by inlier
+    count and averaging reduces that noise instead of committing to whichever
+    single tile happened to be evaluated first. With one supporting tile this
+    reduces to that tile's own estimate.
+    """
+    members = [by_id[cid] for cid in member_candidate_ids
+              if cid in by_id and by_id[cid].center is not None
+              and by_id[cid].hom.ok and by_id[cid].hom.plausible]
+    if not members:
+        return None, None
+
+    weights = np.array([max(m.hom.inliers, 1) for m in members], dtype=np.float64)
+    weights = weights / weights.sum()
+
+    centers = np.array([m.center for m in members], dtype=np.float64)
+    center = (centers * weights[:, None]).sum(axis=0)
+
+    polygons = np.array([m.polygon for m in members], dtype=np.float64)  # (N, 4, 2)
+    polygon = (polygons * weights[:, None, None]).sum(axis=0)
+    return center, polygon
+
+
 def _project_inliers(ev: "CandidateEvaluation", work_scale: float,
                      limit: int = 400) -> Optional[np.ndarray]:
     """
@@ -400,7 +448,9 @@ def _project_inliers(ev: "CandidateEvaluation", work_scale: float,
 def _render_all(job_dir: Path, record: MapRecord, map_img: np.ndarray,
                 drone_img: np.ndarray, pre: PreprocessResult, work_img: np.ndarray,
                 query_feats: FeatureSet, evaluations: List[CandidateEvaluation],
-                best: Optional[CandidateEvaluation], accepted: bool) -> Dict[str, str]:
+                best: Optional[CandidateEvaluation], accepted: bool,
+                agg_polygon: Optional[np.ndarray] = None,
+                agg_center: Optional[np.ndarray] = None) -> Dict[str, str]:
     """Write every processing-stage image for this job (spec section 43)."""
     images: Dict[str, np.ndarray] = {
         "original": drone_img,
@@ -432,8 +482,12 @@ def _render_all(job_dir: Path, record: MapRecord, map_img: np.ndarray,
             work_img, best.tile_image, best.query_pts_work, best.target_pts_work,
             mask, inliers_only=True)
 
-    polygon = best.polygon if (best is not None and accepted) else None
-    center = best.center if (best is not None and accepted) else None
+    # The winning cluster's confidence-weighted geometry, falling back to the
+    # representative tile's own projection if aggregation found nothing.
+    polygon = (agg_polygon if agg_polygon is not None
+              else best.polygon if best is not None else None) if accepted else None
+    center = (agg_center if agg_center is not None
+             else best.center if best is not None else None) if accepted else None
     box = None
     if best is not None and best.tile is not None:
         box = {"x": best.tile.x, "y": best.tile.y,
@@ -447,29 +501,48 @@ def _render_all(job_dir: Path, record: MapRecord, map_img: np.ndarray,
 
 def _build_result(record: MapRecord, status: MatchStatus, explanation: str,
                   best: Optional[CandidateEvaluation],
-                  best_score: Optional[CandidateScore],
+                  best_cluster: Optional[ClusterScore],
                   scores: List[CandidateScore],
                   evaluations: List[CandidateEvaluation],
                   renders: Dict[str, str], drone_img: np.ndarray,
                   pre: PreprocessResult, query_feats: FeatureSet,
                   map_w: int, map_h: int, timings: Dict[str, float],
-                  t_start: float, engine) -> dict:
+                  t_start: float, engine,
+                  agg_center: Optional[np.ndarray] = None,
+                  agg_polygon: Optional[np.ndarray] = None,
+                  cluster_scores: Optional[List[ClusterScore]] = None) -> dict:
     """Assemble the API payload (spec section 41)."""
     dh, dw = drone_img.shape[:2]
     accepted = status in (MatchStatus.MATCH_FOUND, MatchStatus.LOW_CONFIDENCE)
     by_id = {e.score.candidate_id: e for e in evaluations}
+    cluster_scores = cluster_scores or ([best_cluster] if best_cluster else [])
+    cluster_by_candidate: Dict[int, ClusterScore] = {
+        cid: c for c in cluster_scores for cid in c.member_candidate_ids
+    }
 
     map_pixel = None
     polygon = None
     gps = None
     polygon_gps = None
-    if best is not None and accepted and best.center is not None:
-        map_pixel = {"x": int(round(float(best.center[0]))),
-                     "y": int(round(float(best.center[1])))}
-        polygon = hg.clamp_polygon(best.polygon, map_w, map_h)
+    center = agg_center if agg_center is not None else (best.center if best else None)
+    outline = agg_polygon if agg_polygon is not None else (best.polygon if best else None)
+    if accepted and center is not None:
+        map_pixel = {"x": int(round(float(center[0]))), "y": int(round(float(center[1])))}
+        polygon = hg.clamp_polygon(outline, map_w, map_h)
         if record.georeference is not None:
-            gps = record.georeference.pixel_to_latlon(best.center[0], best.center[1])
+            gps = record.georeference.pixel_to_latlon(center[0], center[1])
             polygon_gps = record.georeference.polygon_to_latlon(polygon)
+
+    # Combine RANSAC inliers projected by every tile supporting the winning
+    # location, not just the representative, so the map shows the full body
+    # of evidence behind the fix.
+    inlier_points: List[List[float]] = []
+    if accepted and best_cluster is not None:
+        for cid in best_cluster.member_candidate_ids:
+            ev = by_id.get(cid)
+            if ev is not None and ev.inlier_map_points is not None:
+                inlier_points.extend([round(float(x), 1), round(float(y), 1)]
+                                     for x, y in ev.inlier_map_points)
 
     candidates = []
     for s in scores:
@@ -481,47 +554,55 @@ def _build_result(record: MapRecord, status: MatchStatus, explanation: str,
         entry["source"] = ev.source if ev else "tile"
         if ev is not None and ev.polygon is not None:
             entry["polygon"] = hg.clamp_polygon(ev.polygon, map_w, map_h)
+        cluster = cluster_by_candidate.get(s.candidate_id)
+        entry["cluster_id"] = cluster.cluster_id if cluster else None
+        entry["cluster_rank"] = cluster.rank if cluster else None
         candidates.append(entry)
 
     caps = probe_capabilities()
-    metrics = best.hom.to_dict() if best is not None else hg.HomographyResult(ok=False).to_dict()
+    hom_dict = best.hom.to_dict() if best is not None else hg.HomographyResult(ok=False).to_dict()
+    cluster_dict = best_cluster.to_dict() if best_cluster is not None else None
 
     return {
         "status": status.value,
         "status_message": status_message(status),
         "explanation": explanation,
-        "confidence": round(float(best_score.final_score), 4) if best_score else 0.0,
+        "confidence": round(float(best_cluster.final_score), 4) if best_cluster else 0.0,
         "accepted": bool(accepted),
         "best_candidate": ({
-            "candidate_id": best_score.candidate_id,
-            "tile_id": best_score.tile_id,
-            "dino_similarity": round(float(best_score.dino_similarity), 4),
-            "rotation_applied_deg": int(best_score.rotation_applied) * 90,
+            "candidate_id": best_cluster.representative_id,
+            "tile_id": best_cluster.tile_id,
+            "dino_similarity": round(float(best_cluster.dino_similarity), 4),
+            "rotation_applied_deg": int(best.score.rotation_applied) * 90 if best else 0,
             "source": best.source if best else "tile",
             "tile": best.tile.to_dict() if (best and best.tile) else None,
-        } if best_score else None),
+            "supporting_tiles": best_cluster.support,
+            "member_tile_ids": [by_id[cid].tile.tile_id for cid in best_cluster.member_candidate_ids
+                                if cid in by_id and by_id[cid].tile is not None],
+        } if best_cluster else None),
         "feature_metrics": {
-            "raw_matches": metrics["raw_matches"],
-            "ransac_inliers": metrics["ransac_inliers"],
-            "inlier_ratio": metrics["inlier_ratio"],
-            "spatial_coverage": metrics["spatial_coverage"],
-            "reprojection_error": metrics["reprojection_error"],
-            "homography_valid": metrics["homography_valid"],
-            "coverage_cells": metrics["coverage_cells"],
-            "coverage_grid": metrics["coverage_grid"],
-            "rejection": metrics["rejection"],
+            "raw_matches": cluster_dict["raw_matches"] if cluster_dict else hom_dict["raw_matches"],
+            "ransac_inliers": cluster_dict["inliers"] if cluster_dict else hom_dict["ransac_inliers"],
+            "inlier_ratio": cluster_dict["inlier_ratio"] if cluster_dict else hom_dict["inlier_ratio"],
+            "spatial_coverage": (cluster_dict["spatial_coverage"] if cluster_dict
+                                 else hom_dict["spatial_coverage"]),
+            "reprojection_error": (cluster_dict["reprojection_error"] if cluster_dict
+                                   else hom_dict["reprojection_error"]),
+            "homography_valid": hom_dict["homography_valid"],
+            "coverage_cells": hom_dict["coverage_cells"],
+            "coverage_grid": hom_dict["coverage_grid"],
+            "rejection": cluster_dict["rejection"] if cluster_dict else hom_dict["rejection"],
+            "supporting_tiles": best_cluster.support if best_cluster else 0,
         },
         "homography": (best.H_map.tolist() if (best and best.H_map is not None) else None),
         "map_pixel": map_pixel,
         "polygon": polygon,
-        "inlier_map_points": ([[round(float(x), 1), round(float(y), 1)]
-                               for x, y in best.inlier_map_points]
-                              if (best is not None and accepted
-                                  and best.inlier_map_points is not None) else []),
+        "inlier_map_points": inlier_points,
         "gps": gps,
         "polygon_gps": polygon_gps,
         "georeferenced": record.georeference is not None,
         "candidates": candidates,
+        "location_clusters": [c.to_dict() for c in cluster_scores],
         "drone_image": {"width": dw, "height": dh,
                         "aspect_ratio": round(dw / dh, 4) if dh else 0.0},
         "map_image": {"width": map_w, "height": map_h,

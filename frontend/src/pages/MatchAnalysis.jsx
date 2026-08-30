@@ -41,8 +41,13 @@ export default function MatchAnalysis() {
   }
 
   const m = result.feature_metrics
-  const runnerUp = candidates[1]
-  const gap = runnerUp ? result.confidence - runnerUp.final_score : null
+  // Compare against the runner-up *location cluster*, not the next tile in
+  // the raw candidate list - a nearby tile in that list is often just
+  // corroborating evidence for the winning location, not a genuine rival.
+  const clusters = result.location_clusters || []
+  const winningCluster = clusters[0]
+  const runnerUpCluster = clusters.find((c) => c.cluster_id !== winningCluster?.cluster_id)
+  const gap = runnerUpCluster ? result.confidence - runnerUpCluster.final_score : null
 
   return (
     <div className="space-y-5">
@@ -62,15 +67,16 @@ export default function MatchAnalysis() {
       {/* ---- decision summary ---- */}
       <section className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
         <MetricCard label="Winning confidence" value={percent(result.confidence, 1)} tone="brand" />
-        <MetricCard label="Runner-up"
-                    value={runnerUp ? percent(runnerUp.final_score, 1) : '--'}
-                    hint={runnerUp ? `Tile ${runnerUp.tile_id}` : 'Single candidate only'} />
+        <MetricCard label="Runner-up location"
+                    value={runnerUpCluster ? percent(runnerUpCluster.final_score, 1) : '--'}
+                    hint={runnerUpCluster ? `Near tile ${runnerUpCluster.tile_id}` : 'Only one location found'} />
         <MetricCard label="Decision margin" value={gap === null ? '--' : percent(gap, 1)}
                     tone={gap !== null && gap < 0.06 ? 'warn' : 'ok'}
-                    hint="Below the ambiguity gap triggers AMBIGUOUS" />
-        <MetricCard label="Verified candidates"
-                    value={`${candidates.filter((c) => c.homography_valid).length} / ${candidates.length}`}
-                    hint="Passed all geometric gates" />
+                    hint="Between distinct map locations - below the gap triggers AMBIGUOUS" />
+        <MetricCard label="Supporting tiles"
+                    value={winningCluster ? `${winningCluster.support} / ${winningCluster.member_tile_count}` : '--'}
+                    tone={winningCluster?.support > 1 ? 'ok' : 'default'}
+                    hint="Tiles independently corroborating the winning location" />
       </section>
 
       {/* ---- correspondences ---- */}

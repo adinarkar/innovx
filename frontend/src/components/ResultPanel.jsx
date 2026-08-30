@@ -76,26 +76,28 @@ export default function ResultPanel({ result, mapInfo }) {
       {/* ---- metrics ---- */}
       <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
         <MetricCard label="Feature Matches" value={number(m.raw_matches)}
-                    hint="Correspondences before RANSAC" />
+                    hint="Correspondences before RANSAC, summed across supporting tiles" />
         <MetricCard label="RANSAC Inliers" value={number(m.ransac_inliers)}
-                    tone="brand" hint="Geometrically consistent matches" />
-        <MetricCard label="Inlier Ratio" value={percent(m.inlier_ratio)}
-                    hint="Inliers / raw matches" />
+                    tone="brand" hint="Combined evidence from every supporting tile" />
+        <MetricCard label="Supporting Tiles" value={number(m.supporting_tiles)}
+                    tone={m.supporting_tiles > 1 ? 'ok' : 'default'}
+                    hint={m.supporting_tiles > 1
+                      ? 'Independent overlapping tiles agreeing on this location'
+                      : 'Only one tile verified this location'} />
         <MetricCard label="Spatial Coverage" value={percent(m.spatial_coverage)}
                     hint={`${m.coverage_cells ?? 0} of ${(m.coverage_grid ?? 4) ** 2} grid cells`} />
+        <MetricCard label="Inlier Ratio" value={percent(m.inlier_ratio)}
+                    hint="Inliers / raw matches" />
         <MetricCard label="Reprojection Error"
                     value={m.reprojection_error === null ? '--' : px(m.reprojection_error)}
-                    hint="Mean over inliers" />
+                    hint="Inlier-weighted average across supporting tiles" />
         <MetricCard label="Homography"
                     value={m.homography_valid ? 'VALID' : 'REJECTED'}
                     tone={m.homography_valid ? 'ok' : 'bad'}
                     hint={rejectionLabel(m.rejection) || 'Passed all plausibility gates'} />
-        <MetricCard label="Map X"
-                    value={result.map_pixel ? `${result.map_pixel.x} px` : '--'}
-                    hint="Estimated drone centre" />
-        <MetricCard label="Map Y"
-                    value={result.map_pixel ? `${result.map_pixel.y} px` : '--'}
-                    hint="Estimated drone centre" />
+        <MetricCard label="Map Position"
+                    value={result.map_pixel ? `${result.map_pixel.x}, ${result.map_pixel.y}` : '--'}
+                    hint="Confidence-weighted average across supporting tiles" />
       </div>
 
       {/* ---- GPS ---- */}
