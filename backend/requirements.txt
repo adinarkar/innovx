@@ -1,0 +1,16 @@
+# --- Core API ---
+fastapi>=0.110
+uvicorn[standard]>=0.27
+python-multipart>=0.0.9
+pydantic>=2.6
+pydantic-settings>=2.2
+
+# --- Imaging / classical CV (always required) ---
+numpy>=1.26
+opencv-contrib-python>=4.9
+Pillow>=10.2
+
+# --- Optional AI stack -------------------------------------------------
+# The pipeline runs without these (classical retrieval + SIFT fallback),
+# but DINOv2 / SuperPoint / LightGlue are only active when installed.
+# Install with:  pip install -r requirements-ai.txt

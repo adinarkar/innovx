@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Backend runtime artefacts
+backend/uploads/*
+backend/processed/*
+backend/cache/*
+!backend/uploads/.gitkeep
+!backend/processed/.gitkeep
+!backend/cache/.gitkeep
+
+# Node
+node_modules/
+frontend/dist/
+
+# Generated test data
+test_data/generated/
+
+# Environment
+.env
+.env.local
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

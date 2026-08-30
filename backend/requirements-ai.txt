@@ -1,0 +1,9 @@
+# Optional AI stack for REAL AI MODE.
+# Install AFTER requirements.txt. Pick the torch build for your machine:
+#   CPU  : pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+#   CUDA : pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+torch>=2.2
+torchvision>=0.17
+# SuperPoint + LightGlue reference implementation
+lightglue @ git+https://github.com/cvg/LightGlue.git
+# DINOv2 is pulled at runtime through torch.hub (facebookresearch/dinov2)
