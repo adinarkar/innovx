@@ -341,7 +341,7 @@ structural gate:
 | scale ratio 0.04–25× | implausible area change |
 | shear ≤ 0.7 | transforms no planar view could produce |
 | opposite-edge ratio ≤ 4× | extreme perspective |
-| ≥ 15 inliers, ≥ 18% inlier ratio | thin support |
+| ≥ 15 inliers, ≥ 30% inlier ratio | thin support |
 | reprojection error ≤ 8 px | poor fits |
 | ≥ 25% spatial coverage | inliers clustered on one building |
 
@@ -508,7 +508,7 @@ All settings are environment variables with defaults — see `.env.example`.
 | `WORK_SIZE` | `960` | Long edge used for feature extraction |
 | `RANSAC_THRESHOLD` | `7.5` | Reprojection threshold in pixels (scales with `WORK_SIZE`) |
 | `MIN_INLIERS` | `15` | Hard acceptance floor |
-| `MIN_INLIER_RATIO` | `0.18` | Hard acceptance floor |
+| `MIN_INLIER_RATIO` | `0.30` | Hard acceptance floor |
 | `MAX_REPROJECTION_ERROR` | `12.0` | Hard acceptance ceiling (scales with `WORK_SIZE`) |
 | `MIN_SPATIAL_COVERAGE` | `0.25` | Hard acceptance floor |
 | `MATCH_CONFIDENCE` | `0.60` | `MATCH_FOUND` threshold |

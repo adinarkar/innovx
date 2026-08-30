@@ -64,7 +64,7 @@ class Settings(BaseSettings):
     # changes, rather than left stale at the old pixel scale.
     ransac_threshold: float = 7.5
     min_inliers: int = 15
-    min_inlier_ratio: float = 0.18
+    min_inlier_ratio: float = 0.30
     max_reprojection_error: float = 12.0
     min_spatial_coverage: float = 0.25
     coverage_grid: int = 4          # 4x4 grid, see spec section 18
