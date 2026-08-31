@@ -234,8 +234,8 @@ def _build_representations(pre: PreprocessResult, stage: Callable
         except Exception as exc:
             meta["structural"] = {"state": "skipped", "error": str(exc)}
             log.warning("Structural representation failed (%s) - skipping branch.", exc)
-        stage("structure", "Building structural representation...",
-              meta["structural"]["state"] if "structural" in meta else "skipped",
+        _st = "done" if meta.get("structural", {}).get("state") == "ready" else "skipped"
+        stage("structure", "Building structural representation...", _st,
               meta.get("structural", {}).get("error"))
     else:
         meta["structural"] = {"state": "skipped", "error": "disabled"}
@@ -254,8 +254,9 @@ def _build_representations(pre: PreprocessResult, stage: Callable
         except Exception as exc:
             meta["map"] = {"state": "skipped", "error": str(exc)}
             log.warning("Sat2Map translation failed (%s) - skipping branch.", exc)
-        stage("translate", "Generating map-style representation...",
-              meta["map"]["state"], meta.get("map", {}).get("error"))
+        _mt = "done" if meta.get("map", {}).get("state") == "ready" else "skipped"
+        stage("translate", "Generating map-style representation...", _mt,
+              meta.get("map", {}).get("error"))
     else:
         meta["map"] = {"state": "skipped", "error": engine.status}
         stage("translate", "Generating map-style representation...", "skipped",

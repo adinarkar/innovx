@@ -38,7 +38,7 @@ def test_rgb_always_present_structural_on_by_default(synthetic_frame, monkeypatc
     assert "structural" in reps and reps["structural"].ndim == 3
     assert meta["structural"]["state"] == "ready"
     assert meta["map"]["state"] == "skipped"       # no checkpoint
-    assert ("structure", "ready") in events
+    assert ("structure", "done") in events
     assert ("translate", "skipped") in events
     assert "structural_edge_density" in stats
 
