@@ -570,6 +570,132 @@ def representation_consensus(positions: Dict[str, Tuple[float, float]],
     return res
 
 
+@dataclass
+class FusedConfidence:
+    """
+    The reported ``overall`` confidence and its cross-representation breakdown
+    (spec Phase 8).
+
+    ``base`` is the RGB/geometric cluster score - the anchor. ``overall`` is
+    ``base`` adjusted only by *verified* auxiliary representations: agreement
+    adds up to ``consensus_bonus_cap`` (and only when the RGB homography
+    passed), disagreement subtracts up to ``consensus_penalty_cap``. A branch
+    that failed its own verification contributes nothing either way, so a
+    missing or hallucinating Sat2Map output can never by itself move the fix.
+    """
+    overall: float
+    base: float
+    components: Dict[str, float] = field(default_factory=dict)   # per-representation geo score
+    weights: Dict[str, float] = field(default_factory=dict)
+    applied_bonus: float = 0.0
+    applied_penalty: float = 0.0
+    consensus: Optional[bool] = None
+    corroborating: List[str] = field(default_factory=list)
+    dissenting: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {
+            "overall": round(float(self.overall), 4),
+            "base_rgb": round(float(self.base), 4),
+            "components": {k: round(float(v), 4) for k, v in self.components.items()},
+            "weights": {k: round(float(v), 4) for k, v in self.weights.items()},
+            "applied_bonus": round(float(self.applied_bonus), 4),
+            "applied_penalty": round(float(self.applied_penalty), 4),
+            "consensus": self.consensus,
+            "corroborating": list(self.corroborating),
+            "dissenting": list(self.dissenting),
+        }
+
+
+def fuse_confidence(base: float, rgb_homography_valid: bool,
+                    rep_scores: List["RepresentationScore"],
+                    consensus: Optional["ConsensusResult"]) -> FusedConfidence:
+    """Blend measurable auxiliary evidence into the RGB-anchored confidence."""
+    base = _clamp01(base)
+    fused = FusedConfidence(overall=base, base=base)
+    for s in rep_scores:
+        fused.components[s.representation] = s.geometric_score
+        fused.weights[s.representation] = s.weight
+
+    verified = [s for s in rep_scores
+                if s.representation != "rgb" and s.homography_plausible
+                and s.map_center is not None]
+    if not verified or consensus is None:
+        fused.consensus = (consensus.agree if consensus is not None else None)
+        return fused
+
+    tol = max(float(consensus.tolerance_px), 1.0)
+    bonus = penalty = 0.0
+    for s in verified:
+        off = consensus.offsets_px.get(s.representation)
+        if off is None:
+            continue
+        if off <= tol:
+            closeness = _clamp01(1.0 - off / tol)
+            bonus += closeness * s.weight * s.geometric_score
+            fused.corroborating.append(s.representation)
+        else:
+            over = _clamp01((off - tol) / tol)
+            penalty += over * s.weight
+            fused.dissenting.append(s.representation)
+
+    # RGB is the safety anchor - no bonus can be claimed when its own
+    # homography failed verification.
+    fused.applied_bonus = (0.0 if not rgb_homography_valid
+                           else _clamp01(bonus) * settings.consensus_bonus_cap)
+    fused.applied_penalty = _clamp01(penalty) * settings.consensus_penalty_cap
+    fused.overall = _clamp01(base * (1.0 + fused.applied_bonus - fused.applied_penalty))
+    fused.consensus = consensus.agree
+    return fused
+
+
+def refine_status(status: MatchStatus, explanation: str, fused: FusedConfidence,
+                  consensus: Optional["ConsensusResult"], rgb_homography_valid: bool,
+                  aux_verified: int) -> tuple[MatchStatus, str]:
+    """
+    Re-grade the verdict against the fused confidence (spec Phase 8: NO_MATCH
+    when evidence is insufficient; agreement can promote, disagreement demotes).
+
+    The RGB branch keeps priority: if its homography never verified, nothing
+    here can manufacture a match. Promotion from LOW to MATCH needs the RGB
+    homography valid *and* an independent representation actually corroborating
+    the location - never an auxiliary branch acting alone.
+    """
+    if not rgb_homography_valid or status in (MatchStatus.NO_MATCH, MatchStatus.AMBIGUOUS):
+        return status, explanation
+
+    x = fused.overall
+    if x < settings.low_confidence:
+        return (MatchStatus.NO_MATCH,
+                f"{explanation} Cross-representation fusion lowered confidence to "
+                f"{x:.0%}, below the {settings.low_confidence:.0%} no-match threshold.")
+
+    if status == MatchStatus.MATCH_FOUND:
+        if x < settings.match_confidence:
+            return (MatchStatus.LOW_CONFIDENCE,
+                    f"{explanation} Fused confidence {x:.0%} is below the "
+                    f"{settings.match_confidence:.0%} reporting threshold.")
+        if consensus is not None and not consensus.agree:
+            return (MatchStatus.LOW_CONFIDENCE,
+                    f"{explanation} Independent representations disagree on the "
+                    f"location (max {consensus.max_disagreement_px:.0f}px apart) - "
+                    "treat the position as indicative only.")
+        if fused.corroborating:
+            return (status, f"{explanation} Corroborated by "
+                    f"{', '.join(fused.corroborating)} ({x:.0%} fused confidence).")
+        return status, explanation
+
+    if status == MatchStatus.LOW_CONFIDENCE:
+        if (x >= settings.match_confidence and aux_verified >= 1
+                and consensus is not None and consensus.agree and fused.corroborating):
+            return (MatchStatus.MATCH_FOUND,
+                    f"Verified geometry corroborated by {', '.join(fused.corroborating)} "
+                    f"at {x:.0%} fused confidence.")
+        return status, explanation
+
+    return status, explanation
+
+
 def decide(scores: List[ClusterScore]) -> tuple[MatchStatus, str]:
     """
     Turn the ranked locations into a status plus a human-readable explanation.

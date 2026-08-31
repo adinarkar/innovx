@@ -96,6 +96,13 @@ class Settings(BaseSettings):
     structural_weight: float = 0.25
     sat2map_weight: float = 0.15
     retrieval_weight: float = 0.20
+    # Cross-representation fusion bounds (spec Phase 8). The RGB/geometric
+    # branch is the safety anchor: agreeing auxiliary representations may lift
+    # the reported confidence by at most ``consensus_bonus_cap``, and only when
+    # the RGB homography itself passed. A disagreeing branch may cut confidence
+    # by up to ``consensus_penalty_cap`` - deliberately the larger of the two.
+    consensus_bonus_cap: float = 0.20
+    consensus_penalty_cap: float = 0.35
     # Optional reference-map type hint: satellite | roadmap | terrain | unknown.
     reference_map_type: str = "unknown"
 

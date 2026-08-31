@@ -392,6 +392,12 @@ components sum to a genuine 0–1 score:
 A candidate whose homography was rejected is capped at 0.35 and can never
 present as a confident match.
 
+When the cross-domain representations are active, this RGB score is then fused
+with the independently-verified structural / map evidence — see
+[Cross-domain confidence fusion](#cross-domain-confidence-fusion). Agreement
+raises it (bounded), disagreement lowers it, and the verdict is re-graded
+against the fused number.
+
 | Status | Meaning |
 |---|---|
 | `MATCH_FOUND` | Verified geometry, confidence ≥ 0.60 |
@@ -455,9 +461,30 @@ API returns `representation_scores` (per-branch inliers / inlier ratio /
 reprojection error / homography validity / geometric score / fusion weight) and
 a `consensus` block (`agree`, `tolerance_px`, `max_disagreement_px`,
 `offsets_px`), shown in the result panel's **Cross-Representation Evidence**
-table. This is evidence only in this milestone — the RGB branch keeps sole
-authority over the position; fusion into the confidence number lands in the
-next milestone.
+table.
+
+### Cross-domain confidence fusion
+
+The reported `confidence` is the RGB/geometric cluster score **adjusted only by
+auxiliary representations that passed their own verification**:
+
+- a verified branch whose estimate lands within tolerance of the RGB fix adds
+  up to `CONSENSUS_BONUS_CAP` (weighted by its fusion weight and geometric
+  score) — **and only when the RGB homography itself passed**;
+- a verified branch that lands somewhere else subtracts up to
+  `CONSENSUS_PENALTY_CAP` (deliberately the larger cap);
+- a branch that failed its own verification contributes nothing, so a missing
+  or hallucinating Sat2Map output can never move or create a fix.
+
+`confidence_breakdown` in the API carries `base_rgb`, `applied_bonus`,
+`applied_penalty`, `corroborating`, `dissenting` and `overall`.
+
+The verdict is then re-graded against the fused number: `MATCH_FOUND` drops to
+`LOW_CONFIDENCE` (or `NO_MATCH`) if fusion pulls confidence below the
+thresholds or the representations disagree on the location; `LOW_CONFIDENCE` is
+promoted to `MATCH_FOUND` **only** when the RGB homography is valid *and* an
+independent representation genuinely corroborates the same location. A failed
+RGB branch is never promoted by anything.
 
 ### Sat2Maps training
 
@@ -620,6 +647,8 @@ All settings are environment variables with defaults — see `.env.example`.
 | `REPRESENTATION_MATCHING_TOP_N` | `3` | Strongest RGB-verified candidates that also get independent structural/map matching |
 | `REPRESENTATION_CONSENSUS_PX` | `0` | Agreement tolerance in map px (`0` = derive from frame footprint) |
 | `RGB_WEIGHT` / `STRUCTURAL_WEIGHT` / `SAT2MAP_WEIGHT` / `RETRIEVAL_WEIGHT` | `0.40 / 0.25 / 0.15 / 0.20` | Initial, configurable fusion weights (normalised at use) |
+| `CONSENSUS_BONUS_CAP` | `0.20` | Max confidence lift from agreeing auxiliary representations |
+| `CONSENSUS_PENALTY_CAP` | `0.35` | Max confidence cut from a disagreeing auxiliary representation |
 | `REFERENCE_MAP_TYPE` | `unknown` | `satellite` / `roadmap` / `terrain` / `unknown` hint |
 
 > **Tuned for accuracy over speed.** The defaults above trade processing time

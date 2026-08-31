@@ -164,6 +164,28 @@ export default function ResultPanel({ result, mapInfo }) {
               {px(result.consensus.max_disagreement_px)}
             </p>
           )}
+          {result.confidence_breakdown && (
+            <div className="mt-3 flex flex-wrap gap-x-6 gap-y-1 font-mono text-[11px] text-ink-muted">
+              <span>RGB base: {percent(result.confidence_breakdown.base_rgb, 1)}</span>
+              {result.confidence_breakdown.applied_bonus > 0 && (
+                <span className="text-state-ok">
+                  +{percent(result.confidence_breakdown.applied_bonus, 1)} corroboration
+                  {result.confidence_breakdown.corroborating?.length
+                    ? ` (${result.confidence_breakdown.corroborating.join(', ')})` : ''}
+                </span>
+              )}
+              {result.confidence_breakdown.applied_penalty > 0 && (
+                <span className="text-state-bad">
+                  −{percent(result.confidence_breakdown.applied_penalty, 1)} disagreement
+                  {result.confidence_breakdown.dissenting?.length
+                    ? ` (${result.confidence_breakdown.dissenting.join(', ')})` : ''}
+                </span>
+              )}
+              <span className="text-ink">
+                = {percent(result.confidence_breakdown.overall, 1)} overall
+              </span>
+            </div>
+          )}
         </div>
       )}
 

@@ -30,8 +30,8 @@ from app.localization.imaging import fit_long_edge, imread
 from app.localization.confidence import (CandidateScore, ClusterScore, ConsensusResult,
                                          MatchStatus, RepresentationScore,
                                          cluster_candidates, decide, evaluate_candidate,
-                                         finalize_scores, normalised_weights,
-                                         representation_consensus,
+                                         finalize_scores, fuse_confidence, normalised_weights,
+                                         refine_status, representation_consensus,
                                          representation_geometric_score,
                                          score_clusters, status_message)
 from app.localization.lightglue import (MatchResult, extract_features, match_features,
@@ -494,6 +494,16 @@ def localize(record: MapRecord, drone_path: Path, job_dir: Path,
     rep_scores, consensus = _cross_representation(
         representations, structural_obj, cluster_scores, best_cluster, best,
         by_id, agg_center, same_place_px, work_w, work_h, dw, dh, stage)
+
+    # ---- cross-domain confidence fusion + verdict re-grade (spec Phase 8) --
+    rgb_valid = bool(best_cluster.homography_valid) if best_cluster else False
+    aux_verified = sum(1 for s in rep_scores
+                       if s.representation != "rgb" and s.homography_plausible)
+    base_conf = float(best_cluster.final_score) if best_cluster else 0.0
+    fused = fuse_confidence(base_conf, rgb_valid, rep_scores, consensus)
+    status, explanation = refine_status(status, explanation, fused, consensus,
+                                        rgb_valid, aux_verified)
+    accepted = status in (MatchStatus.MATCH_FOUND, MatchStatus.LOW_CONFIDENCE)
     timings["consensus"] = time.time() - t0
 
     t0 = time.time()
@@ -503,7 +513,8 @@ def localize(record: MapRecord, drone_path: Path, job_dir: Path,
     result = _build_result(record, status, explanation, best, best_cluster, diagnostic_scores,
                            evaluations, renders, drone_img, pre, query_feats,
                            map_w, map_h, timings, t_start, engine,
-                           agg_center, agg_polygon, cluster_scores)
+                           agg_center, agg_polygon, cluster_scores, fused.overall)
+    result["confidence_breakdown"] = fused.to_dict()
     result["representation_scores"] = [s.to_dict() for s in rep_scores]
     result["consensus"] = consensus.to_dict() if consensus is not None else None
     result["cross_representation_agreement"] = (
@@ -861,7 +872,8 @@ def _build_result(record: MapRecord, status: MatchStatus, explanation: str,
                   t_start: float, engine,
                   agg_center: Optional[np.ndarray] = None,
                   agg_polygon: Optional[np.ndarray] = None,
-                  cluster_scores: Optional[List[ClusterScore]] = None) -> dict:
+                  cluster_scores: Optional[List[ClusterScore]] = None,
+                  overall_confidence: Optional[float] = None) -> dict:
     """Assemble the API payload (spec section 41)."""
     dh, dw = drone_img.shape[:2]
     accepted = status in (MatchStatus.MATCH_FOUND, MatchStatus.LOW_CONFIDENCE)
@@ -922,7 +934,9 @@ def _build_result(record: MapRecord, status: MatchStatus, explanation: str,
         "status": status.value,
         "status_message": status_message(status),
         "explanation": explanation,
-        "confidence": round(float(best_cluster.final_score), 4) if best_cluster else 0.0,
+        "confidence": round(float(
+            overall_confidence if overall_confidence is not None
+            else (best_cluster.final_score if best_cluster else 0.0)), 4),
         "accepted": bool(accepted),
         "best_candidate": ({
             "candidate_id": best_cluster.representative_id,
