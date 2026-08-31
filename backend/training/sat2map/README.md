@@ -30,13 +30,31 @@ side-by-side for the same geographic area.
 > (3) prototype visualization, (4) preparing the architecture for a later
 > fine-tune on real InnovX drone imagery.
 
-Download the tiles yourself (this repo never downloads them), then:
+Download the tiles yourself (this repo never downloads them at app startup), then:
 
 ```bash
 cd backend
 python -m training.sat2map.prepare_dataset \
     --src ./raw/sat2maps --out ./datasets/sat2maps --val-split 0.05 --size 256
 ```
+
+### If the UC Berkeley host is unreachable
+
+`http://efrosgans.eecs.berkeley.edu/datasets/larger_sat2maps_cleaned.tar` is
+frequently offline. `fetch_hf_maps.py` pulls the equivalent
+satellite&harr;Google-roadmap pairing from the Hugging Face Hub
+(`huggan/maps` &mdash; the original pix2pix "maps" set, 1096 train / 1098 val,
+600&times;600) into the `--already-split` layout:
+
+```bash
+pip install datasets
+python -m training.sat2map.fetch_hf_maps --repo huggan/maps --out ./raw/sat2maps
+python -m training.sat2map.prepare_dataset \
+    --src ./raw/sat2maps --out ./datasets/sat2maps --already-split --size 256
+```
+
+This is a smaller, prototype-grade substitute &mdash; treat any model trained on
+it as a wiring demo, not a production translator.
 
 Output layout (exact pair correspondence preserved):
 

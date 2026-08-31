@@ -8,3 +8,6 @@
 torch>=2.2
 torchvision>=0.17
 tqdm>=4.66
+# Only needed for training.sat2map.fetch_hf_maps (Hugging Face dataset fallback
+# when the UC Berkeley Sat2Maps host is unreachable).
+datasets>=2.19

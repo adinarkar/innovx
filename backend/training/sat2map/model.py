@@ -59,5 +59,6 @@ class TranslationLoss(torch.nn.Module):
         ssim_loss = 1.0 - _ssim(pred, target)
         edge_loss = F.l1_loss(_edges(pred), _edges(target))
         total = self.w_l1 * l1 + self.w_ssim * ssim_loss + self.w_edge * edge_loss
-        return total, {"l1": float(l1), "ssim_loss": float(ssim_loss),
-                       "edge_loss": float(edge_loss), "total": float(total)}
+        parts = {"l1": l1.detach(), "ssim_loss": ssim_loss.detach(),
+                 "edge_loss": edge_loss.detach(), "total": total.detach()}
+        return total, {k: float(v) for k, v in parts.items()}
