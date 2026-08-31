@@ -18,7 +18,10 @@ from app.logging_config import get_logger
 
 log = get_logger(__name__)
 
-_LOCK = threading.Lock()
+# Reentrant: load_lightglue() holds this lock and then calls load_superpoint(),
+# which re-acquires it on the same thread. A plain Lock self-deadlocks there
+# (only reachable once the torch/LightGlue stack is actually installed).
+_LOCK = threading.RLock()
 _CACHE: Dict[str, Any] = {}
 _FAILED: Dict[str, str] = {}
 
