@@ -1,0 +1,10 @@
+# Tooling config only - the backend is run as a plain package, not installed.
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::UserWarning",
+    # Starlette's TestClient warns about httpx; not actionable for the prototype.
+    "ignore:Using `httpx` with `starlette.testclient`",
+]

@@ -41,8 +41,14 @@ export default function MatchAnalysis() {
   }
 
   const m = result.feature_metrics
-  const runnerUp = candidates[1]
-  const gap = runnerUp ? result.confidence - runnerUp.final_score : null
+  // The decision margin compares the winner against the strongest rival that
+  // points somewhere *different* - an overlapping tile of the same spot is
+  // corroboration, not competition (backend supplies this).
+  const decision = result.decision || {}
+  const anyVerified = (decision.verified_candidates ??
+    candidates.filter((c) => c.homography_valid).length) > 0
+  const gap = decision.margin ?? null
+  const ambiguityGap = decision.ambiguity_gap ?? 0.06
 
   return (
     <div className="space-y-5">
@@ -62,14 +68,21 @@ export default function MatchAnalysis() {
       {/* ---- decision summary ---- */}
       <section className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
         <MetricCard label="Winning confidence" value={percent(result.confidence, 1)} tone="brand" />
-        <MetricCard label="Runner-up"
-                    value={runnerUp ? percent(runnerUp.final_score, 1) : '--'}
-                    hint={runnerUp ? `Tile ${runnerUp.tile_id}` : 'Single candidate only'} />
-        <MetricCard label="Decision margin" value={gap === null ? '--' : percent(gap, 1)}
-                    tone={gap !== null && gap < 0.06 ? 'warn' : 'ok'}
-                    hint="Below the ambiguity gap triggers AMBIGUOUS" />
+        <MetricCard label="Nearest rival"
+                    value={decision.runner_up_confidence != null
+                      ? percent(decision.runner_up_confidence, 1)
+                      : anyVerified ? 'none' : '--'}
+                    hint={decision.runner_up_tile_id != null
+                      ? `Tile ${decision.runner_up_tile_id}, a different location`
+                      : anyVerified
+                        ? 'No competing location — the fix is unique'
+                        : 'No candidate was verified'} />
+        <MetricCard label="Decision margin"
+                    value={!anyVerified ? '--' : gap === null ? 'unchallenged' : percent(gap, 1)}
+                    tone={gap !== null && gap < ambiguityGap ? 'warn' : 'ok'}
+                    hint={`Below ${percent(ambiguityGap, 0)} between two locations triggers AMBIGUOUS`} />
         <MetricCard label="Verified candidates"
-                    value={`${candidates.filter((c) => c.homography_valid).length} / ${candidates.length}`}
+                    value={`${decision.verified_candidates ?? candidates.filter((c) => c.homography_valid).length} / ${candidates.length}`}
                     hint="Passed all geometric gates" />
       </section>
 

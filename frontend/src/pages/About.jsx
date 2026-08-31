@@ -6,8 +6,8 @@ const PIPELINE = [
   ['Reference map', 'Multi-scale overlapping tiles (8-25% of map area, 25% overlap) embedded once and cached.'],
   ['Drone frame', 'Split into a matching branch (mild normalization only) and a visualization branch (edges, contours, structural render).'],
   ['Retrieval', 'Cosine similarity between global descriptors shortlists the top-K candidate regions. Similarity alone never decides a position.'],
-  ['Local features', 'SuperPoint keypoints and descriptors, with SIFT as the fallback and debug matcher.'],
-  ['Matching', 'LightGlue correspondences between the frame and each candidate tile.'],
+  ['Local features', 'SIFT keypoints and descriptors by default; SuperPoint when the optional learned backend is installed.'],
+  ['Matching', 'SIFT + FLANN + Lowe ratio correspondences between the frame and each candidate tile (LightGlue with the learned backend).'],
   ['Verification', 'RANSAC homography plus convexity, scale, shear, reprojection-error and spatial-coverage gates.'],
   ['Decision', 'A weighted confidence over five components, then MATCH_FOUND / LOW_CONFIDENCE / AMBIGUOUS / NO_MATCH.'],
   ['Position', 'Frame corners and centre projected into map pixels, converted to lat/lon only if the map is georeferenced.'],
@@ -25,7 +25,7 @@ export default function About() {
           innov<span className="text-brand">X</span> VisualNav
         </h1>
         <p className="mt-1 text-[15px] font-medium text-ink-soft">
-          AI-Powered Visual Position Recovery
+          Classical computer-vision visual position recovery
         </p>
         <p className="mt-3 max-w-3xl text-[13.5px] leading-relaxed text-ink-muted">
           A drone loses GPS. A downward-facing camera still provides an aerial image. VisualNav

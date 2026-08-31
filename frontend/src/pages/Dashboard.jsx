@@ -9,6 +9,7 @@ import TechnicalDetails from '../components/TechnicalDetails'
 import CandidateCard from '../components/CandidateCard'
 import { Chip } from '../components/Badge'
 import { useApp } from '../hooks/useAppState'
+import { useElapsed } from '../hooks/useElapsed'
 import { apiUrl } from '../services/api'
 import { aspect, bytes } from '../utils/format'
 
@@ -23,6 +24,7 @@ export default function Dashboard() {
   const [selectedCandidate, setSelectedCandidate] = useState(null)
 
   const indexing = mapInfo?.embedding_status === 'indexing'
+  const indexElapsed = useElapsed(indexing)
   const candidates = result?.candidates || []
   const activeCandidate = selectedCandidate ?? candidates[0]?.candidate_id
 
@@ -158,11 +160,22 @@ export default function Dashboard() {
             )}
           </button>
           <p className="text-center text-[12px] text-ink-muted">
-            {indexing
-              ? 'Building candidate regions and embeddings for the reference map...'
-              : ready
-                ? 'Runs retrieval, feature matching and geometric verification on the uploaded pair.'
-                : 'Upload a reference map and a drone capture to enable localization.'}
+            {indexing ? (
+              <>
+                Building candidate regions and embeddings for the reference map…{' '}
+                <span className="font-mono tabular-nums">{indexElapsed.toFixed(0)}s</span>
+                {indexElapsed >= 12 && (
+                  <span className="block text-ink-muted/80">
+                    Large maps take longer to tile and embed — this runs once, then every
+                    localization against this map is fast.
+                  </span>
+                )}
+              </>
+            ) : ready ? (
+              'Runs retrieval, feature matching and geometric verification on the uploaded pair.'
+            ) : (
+              'Upload a reference map and a drone capture to enable localization.'
+            )}
           </p>
           {error && (
             <p className="rounded-lg bg-brand-bg px-4 py-2 text-[12.5px] font-medium text-state-bad ring-1 ring-brand-light">

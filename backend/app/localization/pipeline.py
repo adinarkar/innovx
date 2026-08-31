@@ -14,6 +14,7 @@ result leaves this module.
 from __future__ import annotations
 
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
@@ -27,28 +28,32 @@ from app.localization import dino, homography as hg, visualization as viz
 from app.localization.imaging import fit_long_edge, imread
 from app.localization.confidence import (CandidateScore, MatchStatus, decide,
                                          evaluate_candidate, finalize_scores,
-                                         status_message)
+                                         runner_up_margin, status_message)
 from app.localization.lightglue import (MatchResult, extract_features, match_features,
                                         rotate_image, unrotate_points)
 from app.localization.preprocessing import (CameraCalibration, PreprocessResult,
-                                            run_preprocessing)
+                                            build_visualisations, prepare_for_matching)
 from app.localization.superpoint import FeatureSet
 from app.localization.tiling import Tile, plan_tiles
 from app.models.loader import probe_capabilities
-from app.store import MapRecord
+from app.store import MapRecord, registry
 
 log = get_logger(__name__)
 
 ProgressFn = Callable[[str, str, str, Optional[str]], None]
 
+# The explanatory renders (edges, Structural Terrain View, ...) are computed on
+# this pool so they overlap with retrieval + matching instead of blocking them.
+_VIZ_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="visualnav-viz")
+
 # Stage keys mirrored by the frontend progress animation (spec section 35).
 STAGES = [
     ("prepare", "Preparing reference map..."),
     ("preprocess", "Processing drone frame..."),
-    ("embed", "Computing AI embeddings..."),
+    ("embed", "Computing region embeddings..."),
     ("retrieve", "Searching map for candidate regions..."),
     ("features", "Extracting local features..."),
-    ("match", "Matching structural features..."),
+    ("match", "Matching local features..."),
     ("verify", "Running geometric verification..."),
     ("position", "Estimating position..."),
 ]
@@ -56,6 +61,35 @@ STAGES = [
 
 def _noop(*_args, **_kwargs) -> None:
     return None
+
+
+@dataclass(frozen=True)
+class RunConfig:
+    """
+    Per-request overrides for a single localisation call.
+
+    The pipeline must never mutate the global ``settings`` singleton - the
+    thread pool shares it across concurrent jobs, so a per-request write would
+    leak into every other request.  Everything a caller is allowed to tune is
+    captured here and threaded down explicitly instead.
+    """
+    matcher: str = settings.matcher
+    rotation_search: bool = settings.rotation_search
+    global_fallback: bool = settings.global_fallback
+    top_k: int = settings.top_k_candidates
+
+    @classmethod
+    def build(cls, matcher: Optional[str] = None,
+              rotation_search: Optional[bool] = None,
+              top_k: Optional[int] = None) -> "RunConfig":
+        """Resolve request-supplied overrides against the current defaults."""
+        return cls(
+            matcher=(matcher or settings.matcher).lower(),
+            rotation_search=(settings.rotation_search if rotation_search is None
+                             else bool(rotation_search)),
+            global_fallback=settings.global_fallback,
+            top_k=int(top_k) if top_k else settings.top_k_candidates,
+        )
 
 
 # --------------------------------------------------------------------------
@@ -68,7 +102,10 @@ def build_map_index(record: MapRecord, force: bool = False) -> MapRecord:
     Results are cached on disk so repeated localisation requests against the
     same map skip this entirely.
     """
-    if not force and record.load_cache():
+    engine = dino.get_engine()
+    if not force and record.load_cache(expected_backend=engine.backend):
+        if record.map_id in registry.maps:
+            registry.touch()
         return record
 
     started = time.time()
@@ -78,7 +115,6 @@ def build_map_index(record: MapRecord, force: bool = False) -> MapRecord:
         record.width, record.height = w, h
 
         tiles = plan_tiles(w, h)
-        engine = dino.get_engine()
 
         crops: List[np.ndarray] = []
         for t in tiles:
@@ -100,7 +136,32 @@ def build_map_index(record: MapRecord, force: bool = False) -> MapRecord:
         record.embedding_status = "failed"
         record.error = str(exc)
         log.exception("Map indexing failed for %s", record.map_id)
+    if record.map_id in registry.maps:
+        registry.touch()
     return record
+
+
+def warmup() -> None:
+    """
+    Prime the lazy singletons and OpenCV's first-call costs (SIFT detector,
+    FLANN index, thread pool) so the first real localisation request is not the
+    slow one.  Best-effort - never raises.
+    """
+    try:
+        t0 = time.time()
+        engine = dino.get_engine()
+        rng = np.random.default_rng(0)
+        a = rng.integers(0, 255, (128, 128, 3), dtype=np.uint8)
+        b = np.ascontiguousarray(np.rot90(a))
+        engine.embed(a)
+        fa = extract_features(a)
+        fb = extract_features(b)
+        match_features(fa, fb, a, b)
+        _VIZ_POOL.submit(build_visualisations, a, a, a, False).result(timeout=10)
+        log.info("Pipeline warm-up complete in %.2fs (retrieval=%s, features=%s).",
+                 time.time() - t0, engine.backend, fa.backend)
+    except Exception as exc:                       # pragma: no cover - defensive
+        log.warning("Pipeline warm-up skipped (%s).", exc)
 
 
 # --------------------------------------------------------------------------
@@ -129,16 +190,11 @@ def _prepare_work_image(img: np.ndarray) -> Tuple[np.ndarray, float]:
     return fit_long_edge(img, settings.work_size)
 
 
-def _match_pair(query_img: np.ndarray, query_feats: FeatureSet,
-                target_img: np.ndarray) -> Tuple[MatchResult, FeatureSet]:
-    target_feats = extract_features(target_img)
-    result = match_features(query_feats, target_feats, query_img, target_img)
-    return result, target_feats
-
-
 def _evaluate(query_img: np.ndarray, query_feats: FeatureSet,
               target_img: np.ndarray, rotation: int = 0,
-              canonical_size: Optional[Tuple[int, int]] = None
+              canonical_size: Optional[Tuple[int, int]] = None,
+              matcher: Optional[str] = None,
+              target_feats: Optional[FeatureSet] = None
               ) -> Tuple[hg.HomographyResult, MatchResult]:
     """
     Match then verify, always returning query points in the *canonical*
@@ -146,9 +202,13 @@ def _evaluate(query_img: np.ndarray, query_feats: FeatureSet,
 
     ``query_img``/``query_feats`` must describe the same image - for the
     rotation search that is the rotated copy - while ``canonical_size`` is the
-    unrotated ``(width, height)`` the points are mapped back into.
+    unrotated ``(width, height)`` the points are mapped back into.  Pass
+    ``target_feats`` to reuse an already-extracted tile feature set across the
+    upright and rotated attempts.
     """
-    match, _ = _match_pair(query_img, query_feats, target_img)
+    if target_feats is None:
+        target_feats = extract_features(target_img, prefer=matcher)
+    match = match_features(query_feats, target_feats, query_img, target_img)
     cw, ch = canonical_size or (query_img.shape[1], query_img.shape[0])
     if rotation:
         q_pts = unrotate_points(match.query_pts, rotation, cw, ch)
@@ -162,13 +222,19 @@ def _evaluate(query_img: np.ndarray, query_feats: FeatureSet,
 def localize(record: MapRecord, drone_path: Path, job_dir: Path,
              calibration: Optional[CameraCalibration] = None,
              progress: Optional[ProgressFn] = None,
-             top_k: Optional[int] = None) -> dict:
+             top_k: Optional[int] = None,
+             run_config: Optional[RunConfig] = None) -> dict:
     """
     Full localisation for one drone frame.  Always returns a structured result
     - including an explicit NO_MATCH - rather than raising for a poor match.
+
+    ``run_config`` carries any per-request overrides; when omitted the current
+    global defaults are used.  ``top_k`` is kept for backwards compatibility and
+    is ignored when ``run_config`` is supplied.
     """
     progress = progress or _noop
-    top_k = top_k or settings.top_k_candidates
+    cfg = run_config or RunConfig.build(top_k=top_k)
+    top_k = cfg.top_k
     t_start = time.time()
     timings: Dict[str, float] = {}
 
@@ -187,7 +253,7 @@ def localize(record: MapRecord, drone_path: Path, job_dir: Path,
     timings["prepare"] = time.time() - t0
     stage("prepare", STAGES[0][1], "done", f"{len(record.tiles)} candidate regions ready")
 
-    # ---- 2. drone preprocessing -----------------------------------------
+    # ---- 2. drone preprocessing ----------------------------------------
     stage(*STAGES[1])
     t0 = time.time()
     drone_img = imread(drone_path)
@@ -195,18 +261,22 @@ def localize(record: MapRecord, drone_path: Path, job_dir: Path,
     if dw * dh > map_w * map_h:
         raise ValueError("The drone image is larger than the reference map. "
                          "Upload a wider-area reference map.")
-    pre: PreprocessResult = run_preprocessing(drone_img, calibration)
-    work_img, work_scale = _prepare_work_image(pre.matching_input)
+    # Only the fast matching branch is on the critical path; the explanatory
+    # renders build on a worker thread and are collected just before stage 9.
+    corrected, matching_input, calib_applied = prepare_for_matching(drone_img, calibration)
+    viz_future = _VIZ_POOL.submit(build_visualisations, drone_img, corrected,
+                                  matching_input, calib_applied)
+    work_img, work_scale = _prepare_work_image(matching_input)
     work_h, work_w = work_img.shape[:2]
     timings["preprocess"] = time.time() - t0
     stage("preprocess", STAGES[1][1], "done",
           f"{dw}x{dh} -> {work_w}x{work_h} working resolution")
 
-    # ---- 3. query embedding ---------------------------------------------
+    # ---- 3. query embedding -------------------------------------------
     stage(*STAGES[2])
     t0 = time.time()
     engine = dino.get_engine()
-    query_embedding = engine.embed(pre.matching_input)
+    query_embedding = engine.embed(matching_input)
     timings["embed"] = time.time() - t0
     stage("embed", STAGES[2][1], "done", f"backend: {engine.backend}")
 
@@ -217,40 +287,65 @@ def localize(record: MapRecord, drone_path: Path, job_dir: Path,
     timings["retrieve"] = time.time() - t0
     stage("retrieve", STAGES[3][1], "done", f"top {len(retrieved)} of {len(record.tiles)} tiles")
 
-    # ---- 5. query features ----------------------------------------------
+    # ---- 5. query features --------------------------------------------
     stage(*STAGES[4])
     t0 = time.time()
-    query_feats = extract_features(work_img)
+    query_feats = extract_features(work_img, prefer=cfg.matcher)
     timings["features"] = time.time() - t0
     stage("features", STAGES[4][1], "done",
           f"{query_feats.count} keypoints ({query_feats.backend})")
 
-    # ---- 6/7. match + verify each candidate ------------------------------
+    # SIFT descriptors are rotation-invariant, so the 90/180/270 search is pure
+    # overhead there; it only pays off for a non-invariant learned extractor.
+    rotation_search_on = cfg.rotation_search and query_feats.backend == "superpoint"
+    if cfg.rotation_search and not rotation_search_on:
+        log.debug("Rotation search skipped: %s features are rotation-invariant.",
+                  query_feats.backend)
+
+    # Rotated query variants + their features, built at most once and shared
+    # across every candidate (spec section 50).
+    _rot_query: Dict[int, Tuple[np.ndarray, FeatureSet]] = {}
+
+    def rotated_query(k: int) -> Tuple[np.ndarray, FeatureSet]:
+        if k not in _rot_query:
+            rimg = rotate_image(work_img, k)
+            _rot_query[k] = (rimg, extract_features(rimg, prefer=cfg.matcher))
+        return _rot_query[k]
+
+    # ---- 6/7. match + verify each candidate ---------------------------
     stage(*STAGES[5])
     t0 = time.time()
     evaluations: List[CandidateEvaluation] = []
+    any_verified = False
     for cand_idx, hit in enumerate(retrieved):
         tile = record.tiles[hit["index"]]
         crop = tile.crop(map_img)
         if crop.size == 0:
             continue
         tile_img, tile_scale = _prepare_work_image(crop)
+        tile_feats = extract_features(tile_img, prefer=cfg.matcher)  # once per tile
 
-        hom, match = _evaluate(work_img, query_feats, tile_img, rotation=0)
+        hom, match = _evaluate(work_img, query_feats, tile_img, rotation=0,
+                               matcher=cfg.matcher, target_feats=tile_feats)
         rotation_used = 0
 
-        # Rotation search: only when the upright attempt is weak, so a strong
-        # match is never disturbed (spec section 50).
-        if settings.rotation_search and not (hom.ok and hom.plausible):
+        # Rotation search runs only while the upright attempt is weak and no
+        # candidate has verified yet - a strong match is never disturbed, and a
+        # confirmed fix elsewhere makes the extra work pointless.
+        if rotation_search_on and not any_verified and not (hom.ok and hom.plausible):
             for k in (1, 2, 3):
-                rot_img = rotate_image(work_img, k)
-                rot_feats = extract_features(rot_img)
+                rot_img, rot_feats = rotated_query(k)
                 cand_hom, cand_match = _evaluate(rot_img, rot_feats, tile_img,
                                                  rotation=k,
-                                                 canonical_size=(work_w, work_h))
+                                                 canonical_size=(work_w, work_h),
+                                                 matcher=cfg.matcher,
+                                                 target_feats=tile_feats)
                 if cand_hom.ok and cand_hom.plausible and cand_hom.inliers > hom.inliers:
                     hom, match, rotation_used = cand_hom, cand_match, k
                     break
+
+        if hom.ok and hom.plausible:
+            any_verified = True
 
         score = evaluate_candidate(cand_idx + 1, tile.tile_id, hit["similarity"],
                                    hom, rotation_used)
@@ -274,38 +369,62 @@ def localize(record: MapRecord, drone_path: Path, job_dir: Path,
     stage(*STAGES[6])
     t0 = time.time()
     verified = [e for e in evaluations if e.hom.ok and e.hom.plausible]
-    if settings.global_fallback and not verified:
-        fallback = _global_fallback(map_img, work_img, query_feats, dw, dh, work_scale)
+    if cfg.global_fallback and not verified:
+        fallback = _global_fallback(map_img, work_img, query_feats, dw, dh,
+                                    work_scale, matcher=cfg.matcher)
         if fallback is not None:
             evaluations.append(fallback)
             log.info("Global fallback recovered a match with %d inliers.",
                      fallback.hom.inliers)
 
-    scores = finalize_scores([e.score for e in evaluations])
+    # Overlapping tiles routinely describe the same place; the projected centres
+    # let both the confidence and the decision logic tell a true ambiguity from
+    # a duplicate detection of one location.
     by_id = {e.score.candidate_id: e for e in evaluations}
-
-    # Overlapping tiles routinely describe the same place; give the decision
-    # logic the projected centres so it can tell a true ambiguity from a
-    # duplicate detection.
     positions = {e.score.candidate_id: (float(e.center[0]), float(e.center[1]))
                  for e in evaluations if e.center is not None}
     same_place_px = _same_place_radius(evaluations, dw, dh)
+
+    scores = finalize_scores([e.score for e in evaluations], positions, same_place_px)
     status, explanation = decide(scores, positions, same_place_px)
+
+    # A frame with almost no distinctive texture (blank sky, still water, heavy
+    # blur) cannot match anything - say that plainly rather than implying the
+    # frame simply lies outside the map.
+    if status is MatchStatus.NO_MATCH and query_feats.count < settings.min_query_keypoints:
+        explanation = (
+            f"The drone frame has very little distinctive texture "
+            f"({query_feats.count} features detected) - too few to localise "
+            f"reliably. Capture a sharper, more detailed downward view.")
+
     timings["verify"] = time.time() - t0
     stage("verify", STAGES[6][1], "done", explanation)
 
-    # ---- 9. position + renders ------------------------------------------
+    # ---- 9. position + renders --------------------------------------
     stage(*STAGES[7])
     t0 = time.time()
     best_score = next((s for s in scores if s.homography_valid), scores[0] if scores else None)
     best = by_id.get(best_score.candidate_id) if best_score else None
     accepted = status in (MatchStatus.MATCH_FOUND, MatchStatus.LOW_CONFIDENCE)
 
+    # Collect the visualisation branch that has been running since stage 2.
+    pre: PreprocessResult = viz_future.result()
+
     renders = _render_all(job_dir, record, map_img, drone_img, pre, work_img,
                           query_feats, evaluations, best, accepted)
     result = _build_result(record, status, explanation, best, best_score, scores,
                            evaluations, renders, drone_img, pre, query_feats,
                            map_w, map_h, timings, t_start, engine)
+    margin, rival = runner_up_margin(scores, positions, same_place_px)
+    result["decision"] = {
+        "margin": round(margin, 4) if margin is not None else None,
+        "runner_up_tile_id": rival.tile_id if rival is not None else None,
+        "runner_up_confidence": (round(float(rival.final_score), 4)
+                                 if rival is not None else None),
+        "ambiguity_gap": settings.ambiguity_gap,
+        "verified_candidates": sum(1 for s in scores if s.homography_valid),
+    }
+
     timings["position"] = time.time() - t0
     stage("position", STAGES[7][1], "done", status_message(status))
     result["timings"] = {k: round(v, 3) for k, v in timings.items()}
@@ -316,7 +435,8 @@ def localize(record: MapRecord, drone_path: Path, job_dir: Path,
 # --------------------------------------------------------------------------
 def _global_fallback(map_img: np.ndarray, work_img: np.ndarray,
                      query_feats: FeatureSet, dw: int, dh: int,
-                     work_scale: float) -> Optional[CandidateEvaluation]:
+                     work_scale: float,
+                     matcher: Optional[str] = None) -> Optional[CandidateEvaluation]:
     """
     Last resort: match the drone frame against the whole (downscaled) map.
 
@@ -325,7 +445,7 @@ def _global_fallback(map_img: np.ndarray, work_img: np.ndarray,
     exactly the same geometric gates as any tile candidate.
     """
     map_small, map_scale = fit_long_edge(map_img, max(settings.work_size * 2, 1280))
-    hom, match = _evaluate(work_img, query_feats, map_small, rotation=0)
+    hom, match = _evaluate(work_img, query_feats, map_small, rotation=0, matcher=matcher)
     if not (hom.ok and hom.plausible):
         return None
 

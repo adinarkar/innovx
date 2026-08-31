@@ -1,16 +1,23 @@
+# innovX VisualNav - backend runtime dependencies
+# ---------------------------------------------------------------------------
+# Target interpreter: Python 3.12 (see backend/.venv, Dockerfile, README).
+# Versions are pinned exactly so every machine builds an identical stack.
+# For a byte-for-byte reproducible install (including transitive deps) use:
+#     pip install -r requirements-lock.txt
+#
+# The prototype runs entirely on classical computer vision - there is no
+# PyTorch dependency here.  The optional learned backend (DINOv2 / SuperPoint /
+# LightGlue) lives in requirements-ai.txt and is never required.
+# ---------------------------------------------------------------------------
+
 # --- Core API ---
-fastapi>=0.110
-uvicorn[standard]>=0.27
-python-multipart>=0.0.9
-pydantic>=2.6
-pydantic-settings>=2.2
+fastapi==0.141.1
+uvicorn[standard]==0.52.4
+python-multipart==0.0.32
+pydantic==2.13.5
+pydantic-settings==2.15.0
 
 # --- Imaging / classical CV (always required) ---
-numpy>=1.26
-opencv-contrib-python>=4.9
-Pillow>=10.2
-
-# --- Optional AI stack -------------------------------------------------
-# The pipeline runs without these (classical retrieval + SIFT fallback),
-# but DINOv2 / SuperPoint / LightGlue are only active when installed.
-# Install with:  pip install -r requirements-ai.txt
+numpy==2.2.6
+opencv-contrib-python-headless==4.11.0.86
+Pillow==11.3.0

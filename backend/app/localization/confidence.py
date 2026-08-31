@@ -86,14 +86,22 @@ def coverage_score(hom: HomographyResult) -> float:
     return _clamp01(hom.spatial_coverage / 0.60)
 
 
-def ambiguity_score(best_geo: float, runner_up_geo: Optional[float]) -> float:
+def ambiguity_score(this_geo: float, best_rival_geo: Optional[float]) -> float:
     """
-    1.0 when the winner is unchallenged, falling towards 0 as the runner-up
-    closes in.  A tiny margin means the map contains repeated structure.
+    How far this candidate's geometry sits *above its strongest rival*.
+
+    1.0 when nothing else comes close, falling to 0 as a rival closes in (a
+    near-tie means the map contains repeated structure).  ``best_rival_geo`` is
+    ``None`` only when there is no other candidate at all.
+
+    Measuring every candidate against the *best other* - rather than against the
+    next one down the list - means only the genuine leader can score highly
+    here; a runner-up is compared to a stronger candidate and lands near 0, so
+    the term can no longer inflate a lower candidate past the leader.
     """
-    if runner_up_geo is None:
+    if best_rival_geo is None:
         return 1.0
-    gap = float(best_geo) - float(runner_up_geo)
+    gap = float(this_geo) - float(best_rival_geo)
     return _clamp01(gap / 0.25)
 
 
@@ -167,14 +175,37 @@ def evaluate_candidate(candidate_id: int, tile_id: int, similarity: float,
     )
 
 
-def finalize_scores(scores: List[CandidateScore]) -> List[CandidateScore]:
-    """Apply the ambiguity term, compute final confidence and rank."""
+def finalize_scores(scores: List[CandidateScore],
+                    positions: Optional[Dict[int, tuple]] = None,
+                    same_place_px: float = 0.0) -> List[CandidateScore]:
+    """
+    Apply the ambiguity term, compute final confidence and rank.
+
+    ``positions`` maps candidate ids to their projected map centre.  Tiles
+    overlap by design, so the same physical location routinely appears as two
+    or three strong candidates - that is corroboration, not ambiguity.  A rival
+    only depresses a candidate's ambiguity score when it places the drone
+    somewhere genuinely *different* (further than ``same_place_px`` away).
+    """
     if not scores:
         return []
+    positions = positions or {}
     ordered = sorted(scores, key=lambda s: s.geometric_score, reverse=True)
+
     for i, s in enumerate(ordered):
-        runner_up = ordered[i + 1].geometric_score if i + 1 < len(ordered) else None
-        s.components["ambiguity"] = ambiguity_score(s.geometric_score, runner_up)
+        p_self = positions.get(s.candidate_id)
+        rival_geos = []
+        for j, other in enumerate(ordered):
+            if j == i:
+                continue
+            p_other = positions.get(other.candidate_id)
+            if (p_self is not None and p_other is not None and same_place_px > 0
+                    and np.hypot(p_self[0] - p_other[0],
+                                 p_self[1] - p_other[1]) <= same_place_px):
+                continue                      # same place -> corroboration
+            rival_geos.append(other.geometric_score)
+        best_rival = max(rival_geos) if rival_geos else None
+        s.components["ambiguity"] = ambiguity_score(s.geometric_score, best_rival)
         s.final_score = _clamp01(sum(WEIGHTS[k] * s.components.get(k, 0.0) for k in WEIGHTS))
         if not s.homography_valid:
             # An invalid homography can never present as a confident match.
@@ -248,6 +279,35 @@ def decide(scores: List[CandidateScore],
     return (MatchStatus.LOW_CONFIDENCE,
             f"A geometrically valid match exists at {best.final_score:.0%} confidence, "
             "below the reporting threshold. Treat the position as indicative only.")
+
+
+def runner_up_margin(scores: List[CandidateScore],
+                     positions: Optional[Dict[int, tuple]] = None,
+                     same_place_px: float = 0.0):
+    """
+    Final-score gap between the best verified candidate and the strongest
+    verified rival that points somewhere *different*.
+
+    Returns ``(margin, rival)`` - ``rival`` is the ``CandidateScore`` or
+    ``None`` when the fix is unchallenged (no other verified candidate at a
+    different location).  This is the number the UI should show as the decision
+    margin: comparing against an overlapping tile of the *same* spot would make
+    a clean, unique match look like a tie.
+    """
+    positions = positions or {}
+    valid = [s for s in scores if s.homography_valid]
+    if not valid:
+        return None, None
+    best = valid[0]
+    p_best = positions.get(best.candidate_id)
+    for rival in valid[1:]:
+        p_rival = positions.get(rival.candidate_id)
+        if (p_best is not None and p_rival is not None and same_place_px > 0
+                and np.hypot(p_best[0] - p_rival[0],
+                             p_best[1] - p_rival[1]) <= same_place_px):
+            continue
+        return float(best.final_score - rival.final_score), rival
+    return None, None
 
 
 def status_message(status: MatchStatus) -> str:

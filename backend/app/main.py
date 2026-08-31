@@ -18,6 +18,7 @@ from fastapi.staticfiles import StaticFiles
 from app import __version__
 from app.api import localize_router, system_router, upload_router
 from app.config import settings
+from app.localization.pipeline import warmup
 from app.logging_config import get_logger, setup_logging
 from app.models.loader import probe_capabilities
 
@@ -47,6 +48,7 @@ async def lifespan(app: FastAPI):
              caps.retrieval_backend, caps.matcher_backend)
     for note in caps.notes:
         log.warning(note)
+    warmup()
     yield
     log.info("innovX VisualNav shutting down.")
 
@@ -99,11 +101,13 @@ async def value_error_handler(_: Request, exc: ValueError):
 
 @app.exception_handler(Exception)
 async def unhandled_handler(request: Request, exc: Exception):
+    # Full traceback goes to the server log only - the response stays generic so
+    # exception text and stack internals never reach the browser.
     log.exception("Unhandled error on %s %s", request.method, request.url.path)
     return JSONResponse(status_code=500, content={
         "status": "error",
         "error": "Internal error while processing the request.",
-        "detail": str(exc),
+        "detail": None,
     })
 
 

@@ -50,6 +50,7 @@ class Settings(BaseSettings):
     top_k_candidates: int = 5
     max_keypoints: int = 2048
     matcher: str = "lightglue"      # lightglue | sift
+    min_query_keypoints: int = 60   # below this a drone frame is "low texture"
 
     # --- geometric verification ---
     ransac_threshold: float = 5.0

@@ -214,7 +214,7 @@ function StageStructural({ result }) {
       <StageHeader
         number="04"
         title="Structural Terrain View"
-        description="AI/computer-vision derived structural representation of the aerial frame, highlighting roads, boundaries and building geometry."
+        description="Computer-vision–derived structural representation of the aerial frame (edge morphology + region simplification), highlighting roads, boundaries and building geometry."
         aside={<Chip tone="brand">VISUALIZATION ONLY</Chip>}
       />
       <div className="grid gap-4 lg:grid-cols-3">
@@ -249,8 +249,8 @@ function StageFeatures({ result }) {
     <section className="card card-pad">
       <StageHeader
         number="05"
-        title="AI Feature Extraction"
-        description="Stable corners, textures, intersections and structural features used for localization."
+        title="Local Feature Extraction"
+        description="Stable corners, textures and intersections used for matching — detected by the active feature backend (shown right)."
         aside={<Chip tone="brand">{k.backend.toUpperCase()}</Chip>}
       />
       <div className="grid gap-4 lg:grid-cols-[1.5fr_1fr]">

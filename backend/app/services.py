@@ -18,9 +18,10 @@ from fastapi import UploadFile
 from app.config import settings
 from app.logging_config import get_logger
 from app.localization.imaging import SUPPORTED_SUFFIXES, ImageError, imread
-from app.localization.pipeline import build_map_index, localize
+from app.localization.pipeline import RunConfig, build_map_index, localize
 from app.localization.preprocessing import CameraCalibration
-from app.store import DroneRecord, JobRecord, MapRecord, new_id, registry
+from app.store import (DroneRecord, JobRecord, MapRecord, file_content_hash,
+                       new_id, registry)
 
 log = get_logger(__name__)
 
@@ -101,6 +102,7 @@ def register_map(file: UploadFile) -> MapRecord:
     rec = MapRecord(map_id=map_id, path=path, width=w, height=h,
                     filename=file.filename or path.name,
                     file_size=path.stat().st_size,
+                    content_hash=file_content_hash(path),
                     embedding_status="indexing")
     registry.add_map(rec)
     EXECUTOR.submit(_index_map, rec)
@@ -146,15 +148,20 @@ def register_drone(file: UploadFile) -> DroneRecord:
 # --------------------------------------------------------------------------
 def start_job(map_id: str, drone_id: str, plan_id: Optional[str] = None,
               top_k: Optional[int] = None,
-              calibration: Optional[dict] = None) -> JobRecord:
+              calibration: Optional[dict] = None,
+              matcher: Optional[str] = None,
+              rotation_search: Optional[bool] = None) -> JobRecord:
     """Create and enqueue a localisation job."""
     job = JobRecord(job_id=new_id("job"), map_id=map_id, drone_id=drone_id, plan_id=plan_id)
     registry.add_job(job)
-    EXECUTOR.submit(_run_job, job, top_k, calibration)
+    # Resolve any per-request overrides now, on the request thread, so the
+    # worker never has to touch the global settings singleton.
+    cfg = RunConfig.build(matcher=matcher, rotation_search=rotation_search, top_k=top_k)
+    EXECUTOR.submit(_run_job, job, cfg, calibration)
     return job
 
 
-def _run_job(job: JobRecord, top_k: Optional[int], calibration: Optional[dict]) -> None:
+def _run_job(job: JobRecord, cfg: RunConfig, calibration: Optional[dict]) -> None:
     job.state = "running"
     map_rec = registry.get_map(job.map_id)
     drone_rec = registry.get_drone(job.drone_id)
@@ -170,7 +177,7 @@ def _run_job(job: JobRecord, top_k: Optional[int], calibration: Optional[dict]) 
 
         result = localize(map_rec, drone_rec.path, job.job_dir,
                           calibration=CameraCalibration.from_dict(calibration),
-                          progress=progress, top_k=top_k)
+                          progress=progress, run_config=cfg)
         result["mode"] = settings.app_mode
         if settings.app_mode == "demo":
             result["mode_warning"] = ("DEMO MODE - these figures come from the demo "

@@ -222,26 +222,60 @@ class PreprocessResult:
     stats: Dict[str, float] = field(default_factory=dict)
 
 
+def prepare_for_matching(img: np.ndarray, calib: Optional[CameraCalibration] = None
+                         ) -> Tuple[np.ndarray, np.ndarray, bool]:
+    """
+    Fast branch: only what the feature extractors actually consume.
+
+    Returns ``(corrected, matching_input, calibration_applied)``.  This is the
+    single piece of preprocessing that sits on the latency-critical path; the
+    explanatory renders are produced separately by :func:`build_visualisations`.
+    """
+    corrected, applied = undistort(img, calib)
+    matching_input = normalize_for_matching(corrected)
+    return corrected, matching_input, applied
+
+
+def build_visualisations(original: np.ndarray, corrected: np.ndarray,
+                         matching_input: np.ndarray,
+                         calibration_applied: bool) -> PreprocessResult:
+    """
+    Slow branch: every explanatory render (enhanced frame, edges, Structural
+    Terrain View, contours).  None of it feeds the pipeline, so it is safe to
+    run off the critical path / on a worker thread.  Never raises - on any
+    failure it degrades to plain stand-ins so a bad render can't fail a good
+    localisation.
+    """
+    try:
+        enhanced = enhance(corrected)
+        gray = to_gray(corrected)
+        edges = edge_map(corrected)
+        structural = structural_terrain(corrected)
+        contours = contour_overlay(corrected)
+        stats = {
+            "mean_brightness_original": round(float(to_gray(original).mean()), 2),
+            "mean_brightness_enhanced": round(float(to_gray(enhanced).mean()), 2),
+            "contrast_original": round(float(to_gray(original).std()), 2),
+            "contrast_enhanced": round(float(to_gray(enhanced).std()), 2),
+            "edge_density": round(float((edges > 0).mean()), 4),
+        }
+    except Exception as exc:                       # pragma: no cover - defensive
+        log.warning("Visualisation branch failed (%s) - using plain stand-ins.", exc)
+        gray = to_gray(corrected)
+        enhanced, structural, contours = corrected, corrected, corrected
+        edges = gray
+        stats = {"visualisation_error": 1.0}
+
+    return PreprocessResult(
+        original=original, corrected=corrected, enhanced=enhanced, grayscale=gray,
+        edges=edges, structural=structural, contours=contours,
+        matching_input=matching_input, calibration_applied=calibration_applied,
+        stats=stats,
+    )
+
+
 def run_preprocessing(img: np.ndarray,
                       calib: Optional[CameraCalibration] = None) -> PreprocessResult:
-    """Execute both branches once and return every intermediate render."""
-    corrected, applied = undistort(img, calib)
-    enhanced = enhance(corrected)
-    gray = to_gray(corrected)
-    edges = edge_map(corrected)
-    structural = structural_terrain(corrected)
-    contours = contour_overlay(corrected)
-    matching_input = normalize_for_matching(corrected)
-
-    stats = {
-        "mean_brightness_original": round(float(to_gray(img).mean()), 2),
-        "mean_brightness_enhanced": round(float(to_gray(enhanced).mean()), 2),
-        "contrast_original": round(float(to_gray(img).std()), 2),
-        "contrast_enhanced": round(float(to_gray(enhanced).std()), 2),
-        "edge_density": round(float((edges > 0).mean()), 4),
-    }
-    return PreprocessResult(
-        original=img, corrected=corrected, enhanced=enhanced, grayscale=gray,
-        edges=edges, structural=structural, contours=contours,
-        matching_input=matching_input, calibration_applied=applied, stats=stats,
-    )
+    """Both branches, synchronously - kept for tests and offline callers."""
+    corrected, matching_input, applied = prepare_for_matching(img, calib)
+    return build_visualisations(img, corrected, matching_input, applied)

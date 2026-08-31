@@ -1,6 +1,6 @@
 # innovX VisualNav
 
-**GPS-Denied Drone Visual Localization** · AI-Powered Visual Position Recovery
+**GPS-Denied Drone Visual Localization** · classical computer-vision position recovery, with an optional learned backend
 
 A working prototype that recovers a drone's position by matching a single
 downward-facing camera frame against a stored reference map — no GPS, no IMU,
@@ -81,9 +81,9 @@ reason, and if none survive, the answer is `NO_MATCH`.
                       │             ▼                          │   never fed back
                       │      Top-K candidates                  │   into matching)
                       │             │                          │
-              SuperPoint keypoints  │                          │
+           SIFT / SuperPoint keypoints                          │
                       │             ▼                          │
-                      └───► LightGlue matching ◄── candidate tile features
+                      └─► SIFT+FLANN / LightGlue matching ◄── candidate tile features
                                     │
                                     ▼
                           RANSAC + homography
@@ -110,12 +110,14 @@ MATCH_FOUND  LOW_CONFIDENCE   AMBIGUOUS      NO_MATCH
 frame corners + centre projected into map pixels → optional lat/lon
 ```
 
-**Graceful degradation.** Every heavy dependency is optional. With PyTorch
-installed the system uses DINOv2 for retrieval and SuperPoint + LightGlue for
-matching. Without it, retrieval falls back to a classical gradient-orientation
-+ colour descriptor and matching falls back to SIFT + FLANN + Lowe ratio. The
-same geometric verification, confidence engine and UI run in both cases, and
-the active backend is reported honestly in the UI and in `/api/system/info`.
+**Backends.** By default — no PyTorch — retrieval uses a classical
+gradient-orientation + colour descriptor and matching uses SIFT + FLANN + Lowe
+ratio. Installing the optional learned stack (`requirements-ai.txt`) switches
+retrieval to a frozen DINOv2 backbone and matching to SuperPoint + LightGlue;
+each is loaded lazily and falls back to the classical path if it is missing or
+fails to load. The same geometric verification, confidence engine and UI run in
+both cases, and the active backend is reported honestly in the UI and in
+`/api/system/info`.
 
 ---
 
@@ -134,11 +136,11 @@ Deliberately out of scope for this stage:
 
 | | |
 |---|---|
-| Python | 3.10 – 3.13 |
+| Python | 3.12 (pinned; 3.12 is what the venv, lock file and Docker image use) |
 | Node.js | 18+ (20+ recommended) |
 | OS | Windows, macOS or Linux |
-| GPU | Optional. CUDA/MPS used automatically when available, else CPU |
-| Disk | ~200 MB for the core stack, ~3 GB more if you install PyTorch |
+| GPU | Optional, and only used by the optional learned backend. The default classical pipeline is CPU-only |
+| Disk | ~250 MB for the core stack, ~3 GB more if you install the optional PyTorch stack |
 
 ---
 
@@ -148,30 +150,44 @@ Deliberately out of scope for this stage:
 
 ```bash
 cd backend
-python -m venv .venv
+py -3.12 -m venv .venv          # any Python 3.12 interpreter
 
 # Windows
 .venv\Scripts\activate
 # macOS / Linux
 source .venv/bin/activate
 
-pip install -r requirements.txt
+pip install -r requirements.txt        # exact pins
+# or, for a byte-for-byte reproducible install including transitive deps:
+pip install -r requirements-lock.txt
 ```
 
-That is enough to run everything. To enable the full AI stack (DINOv2,
-SuperPoint, LightGlue):
+That is enough to run the whole prototype: it uses a **classical computer-vision
+pipeline** (gradient/colour descriptor for retrieval, SIFT + FLANN for matching,
+RANSAC + geometric verification) and has **no PyTorch dependency**.
+
+An **optional** learned backend can be added on top without changing anything
+else — it is loaded lazily and the pipeline falls back to the classical path if
+it is missing:
 
 ```bash
-# CPU-only build
+# CPU-only build (Python 3.12)
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-# or CUDA 12.1
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+# or a CUDA build, e.g.
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
 
 pip install -r requirements-ai.txt
 ```
 
-DINOv2 weights are downloaded on first use through `torch.hub` and cached in
-your local torch hub directory. Nothing is trained.
+DINOv2 weights are then downloaded on first use through `torch.hub` and cached
+in your local torch hub directory. Nothing is trained.
+
+To run the test suite:
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
 
 ### Frontend
 
@@ -255,23 +271,31 @@ python -m scripts.evaluate --data ../test_data/generated
 | 8 | Completely unrelated image | **`NO_MATCH`** |
 | 9 | A different region of the map | successful localization |
 
-Reference run on the synthetic dataset (CPU, classical retrieval + SIFT):
+Reference run on the synthetic dataset (CPU, classical retrieval + SIFT;
+timings are machine-dependent):
 
 ```
 case                   status            conf   inl   err_px  result    time
-test1_direct_crop.jpg  MATCH_FOUND       0.98   573      0.0    PASS    3.0s
-test2_rotated_30.jpg   MATCH_FOUND       0.96   269      1.0    PASS    2.8s
-test3_rotated_90.jpg   MATCH_FOUND       0.96   226      1.4    PASS    3.2s
-test4_brightness.jpg   MATCH_FOUND       0.98   708      0.0    PASS    2.8s
-test5_blur.jpg         MATCH_FOUND       0.96   370      0.0    PASS    2.6s
-test6_resized.jpg      MATCH_FOUND       0.97   586      0.0    PASS    1.8s
-test7_perspective.jpg  MATCH_FOUND       0.96   480     64.4    PASS    2.2s
-test8_unrelated.jpg    NO_MATCH          0.35     8        -    PASS    3.4s
-test9_other_area.jpg   MATCH_FOUND       0.95   574      0.0    PASS    1.6s
+test1_direct_crop.jpg  MATCH_FOUND       0.98   610      0.0    PASS    1.6s
+test2_rotated_30.jpg   MATCH_FOUND       0.96   288      1.0    PASS    1.0s
+test3_rotated_90.jpg   MATCH_FOUND       0.95   224      1.4    PASS    1.0s
+test4_brightness.jpg   MATCH_FOUND       0.98   564      0.0    PASS    1.5s
+test5_blur.jpg         MATCH_FOUND       0.96   334      0.0    PASS    1.4s
+test6_resized.jpg      MATCH_FOUND       0.97   527      0.0    PASS    1.2s
+test7_perspective.jpg  MATCH_FOUND       0.96   592     64.4    PASS    1.9s
+test8_unrelated.jpg    NO_MATCH          0.35    10        -    PASS    1.6s
+test9_other_area.jpg   MATCH_FOUND       0.98   798      0.0    PASS    1.3s
 
 Top-1 accuracy      : 8/8
 No-match detection  : 1/1
 False localizations : 0
+```
+
+The backend also has a pytest smoke suite (geometry gates, confidence maths,
+coordinate rebasing, one full `localize()`, and the HTTP flow):
+
+```bash
+cd backend && pip install -r requirements-dev.txt && pytest
 ```
 
 The same batch scoring is available interactively on the **Developer** page,
@@ -291,9 +315,10 @@ windows whose **area** is a fixed fraction of the map area — 8, 10, 12, 15, 18
 its map-space geometry so a homography solved in tile space can be lifted back
 to absolute map pixels.
 
-Tiles are embedded once when the map is uploaded and cached to
-`backend/cache/{map_id}.npz`, so repeated localization requests against the
-same map skip indexing entirely.
+Tiles are embedded once when the map is uploaded and cached under
+`backend/cache/`, keyed by a hash of the map's content (plus the tiling
+settings and the active backend). Re-uploading the same map — or restarting the
+backend — reuses the existing index instead of recomputing it.
 
 ### 2. Candidate retrieval
 
@@ -315,18 +340,21 @@ frame in the pipeline.
 
 ### 4. Local features and matching
 
-SuperPoint keypoints and descriptors are matched with LightGlue against each
-candidate tile. If LightGlue is unavailable, or returns too few
+By default, SIFT keypoints and descriptors are matched against each candidate
+tile with FLANN + Lowe's ratio test. When the optional learned stack is
+installed, SuperPoint + LightGlue take over; if LightGlue returns too few
 correspondences to be geometrically useful, the pipeline automatically retries
-with SIFT + FLANN + Lowe's ratio test. `MATCHER=sift` forces the classical path
-for debugging and side-by-side comparison.
+that pair with SIFT. `MATCHER=sift` pins the classical path.
 
 ### 5. Rotation handling
 
-Nothing assumes the drone frame is north-up — feature matching is naturally
-rotation tolerant. When the upright attempt *fails* verification, the pipeline
-additionally evaluates the query at 90°, 180° and 270°. A strong upright match
-is never disturbed by this search.
+Nothing assumes the drone frame is north-up. SIFT descriptors are inherently
+rotation-invariant, so the default classical pipeline recovers rotated frames
+directly. When a *non-invariant* learned extractor (SuperPoint) is in use and
+its upright attempt fails verification, the pipeline additionally evaluates the
+query at 90°, 180° and 270° — computing each rotated variant's features once and
+reusing them across candidates, and stopping as soon as any candidate verifies.
+A strong upright match is never disturbed by this search.
 
 ### 6. RANSAC, homography and verification
 
@@ -376,10 +404,12 @@ components sum to a genuine 0–1 score:
 | Inliers | 0.30 | absolute inlier count blended with inlier ratio |
 | Geometry | 0.25 | reprojection error (exponential decay) + shear penalty |
 | Coverage | 0.15 | spatial spread of inliers across the 4×4 grid |
-| Ambiguity | 0.15 | margin over the runner-up candidate |
+| Ambiguity | 0.15 | margin over the strongest rival that points *somewhere else* |
 
 A candidate whose homography was rejected is capped at 0.35 and can never
-present as a confident match.
+present as a confident match. The ambiguity component is measured only against
+rivals that place the drone in a *different* map region — overlapping tiles that
+corroborate the same location do not depress it.
 
 | Status | Meaning |
 |---|---|
@@ -392,6 +422,11 @@ Because tiles overlap by design, the same physical location routinely appears
 as two strong candidates. Ambiguity is only declared when the near-tied
 candidates also *disagree about where the drone is*, by more than a third of
 the projected frame diagonal.
+
+A drone frame with almost no distinctive texture (blank sky, still water, heavy
+motion blur — fewer than `MIN_QUERY_KEYPOINTS` features) is reported as
+`NO_MATCH` with an explanation that names the cause, rather than implying the
+frame lies outside the map.
 
 ---
 
@@ -429,7 +464,7 @@ Swagger UI: <http://localhost:8000/docs> · OpenAPI schema: `/openapi.json`
 | Method | Endpoint | Purpose |
 |---|---|---|
 | `POST` | `/api/map/upload` | Upload the reference map; tiling and embedding start in the background |
-| `GET` | `/api/map/{map_id}` | Indexing status (`pending` → `indexing` → `ready`) |
+| `GET` | `/api/map/{map_id}` | Indexing status (`indexing` → `ready`, or `failed`) |
 | `POST` | `/api/drone/upload` | Upload the drone capture |
 | `POST` | `/api/plan/upload` | Upload and parse a QGroundControl `.plan` |
 | `POST` | `/api/localize` | Start a localization job (202 + `job_id`) |
@@ -441,6 +476,7 @@ Swagger UI: <http://localhost:8000/docs> · OpenAPI schema: `/openapi.json`
 | `GET` | `/api/system/info` | Device, model availability, active thresholds |
 | `GET` | `/api/health` | Liveness probe |
 | `POST` | `/api/dev/batch` | Developer Mode batch scoring |
+| `GET` | `/api/dev/distance` | Great-circle distance between two coordinates |
 | `GET` | `/files/processed/{job_id}/...` | Generated stage renders |
 | `GET` | `/files/uploads/...` | Original uploads |
 
@@ -476,6 +512,8 @@ Swagger UI: <http://localhost:8000/docs> · OpenAPI schema: `/openapi.json`
   "map_pixel": { "x": 1860, "y": 1229 },
   "polygon": [[1709, 668], [2421, 1079], [2010, 1789], [1299, 1379]],
   "gps": { "latitude": 12.9686253, "longitude": 77.6003984 },
+  "decision": { "margin": null, "runner_up_tile_id": null,
+                "ambiguity_gap": 0.06, "verified_candidates": 3 },
   "candidates": [ /* full per-candidate diagnostics */ ],
   "renders": { "structural_map": "job_.../structural_map.png", "...": "..." }
 }
@@ -501,7 +539,8 @@ All settings are environment variables with defaults — see `.env.example`.
 | `MAX_MAP_SIZE` | `8000` | Reference maps are downscaled to this long edge |
 | `TOP_K_CANDIDATES` | `5` | Candidates carried into verification |
 | `MAX_KEYPOINTS` | `2048` | Per-image feature budget |
-| `MATCHER` | `lightglue` | `lightglue` or `sift` |
+| `MIN_QUERY_KEYPOINTS` | `60` | Below this the drone frame is flagged "low texture" |
+| `MATCHER` | `lightglue` | `lightglue` or `sift` (with no learned stack installed, `lightglue` transparently runs SIFT) |
 | `TILE_SCALES` | `0.08…0.25` | Tile areas as a fraction of map area |
 | `TILE_OVERLAP` | `0.25` | Overlap between neighbouring tiles |
 | `MAX_TILES` | `600` | Tile budget; the grid is evenly subsampled beyond it |
@@ -514,7 +553,7 @@ All settings are environment variables with defaults — see `.env.example`.
 | `MATCH_CONFIDENCE` | `0.60` | `MATCH_FOUND` threshold |
 | `LOW_CONFIDENCE` | `0.40` | Below this becomes `NO_MATCH` |
 | `AMBIGUITY_GAP` | `0.06` | Margin below which two candidates tie |
-| `ROTATION_SEARCH` | `true` | Try 90/180/270° when upright fails |
+| `ROTATION_SEARCH` | `true` | Try 90/180/270° when upright fails (learned extractor only; SIFT is already rotation-invariant) |
 | `GLOBAL_FALLBACK` | `true` | Whole-map attempt when all tiles fail |
 
 Frontend: `VITE_API_BASE` (leave unset to use the dev proxy).
@@ -530,18 +569,19 @@ innovx-visualnav/
 │   │   ├── components/      Navbar, UploadCard, MapViewer, CandidateCard, ...
 │   │   ├── pages/           Dashboard, Processing, MatchAnalysis, Developer, About
 │   │   ├── services/        api.js
-│   │   ├── hooks/           useAppState.jsx
+│   │   ├── hooks/           useAppState.jsx, useElapsed.js
 │   │   └── utils/           format.js
 │   ├── tailwind.config.js
 │   └── package.json
 │
 ├── backend/
 │   ├── app/
-│   │   ├── main.py          FastAPI app, CORS, static mounts, error handlers
+│   │   ├── main.py          FastAPI app, CORS, static mounts, error handlers, warm-up
 │   │   ├── config.py        every tunable, no hard-coded paths
-│   │   ├── store.py         in-memory registry + embedding cache
+│   │   ├── store.py         registry (JSON-persisted) + content-hashed embedding cache
 │   │   ├── services.py      uploads and background job execution
 │   │   ├── schemas.py       typed request/response models
+│   │   ├── logging_config.py
 │   │   ├── api/             routes_upload / routes_localize / routes_system
 │   │   ├── localization/
 │   │   │   ├── imaging.py         I/O and resize helpers
@@ -559,8 +599,10 @@ innovx-visualnav/
 │   │   ├── plan/qgc_parser.py
 │   │   └── models/loader.py       lazy model loading, device selection
 │   ├── scripts/evaluate.py        offline accuracy harness
+│   ├── tests/                     pytest smoke suite
 │   ├── cache/  uploads/  processed/
-│   └── requirements.txt · requirements-ai.txt
+│   ├── pyproject.toml
+│   └── requirements.txt · requirements-lock.txt · requirements-dev.txt · requirements-ai.txt
 │
 ├── test_data/generate_test_data.py
 ├── docker-compose.yml
@@ -572,21 +614,58 @@ innovx-visualnav/
 
 ## Presentation flow
 
-1. Upload the reference satellite map — watch tiling and embedding complete.
-2. Upload the drone top-view image.
-3. Click **Locate Drone** and follow the live pipeline stages.
-4. Open **Processing** and step through all nine stages.
-5. Show the **Enhanced** image and the before/after toggle.
-6. Show the **Structural Terrain View** (with its disclaimer).
-7. Show the **AI keypoints**.
-8. Show the **Top candidate regions** and click through to their map locations.
-9. Show the **correspondence lines**, then toggle to RANSAC inliers only.
-10. Show the **geometric verification** metrics and the coverage grid.
-11. Show the **final polygon** on the full map.
-12. Show the **estimated drone centre** marker.
-13. Show the **confidence breakdown** on Match Analysis — why #1 beat #2.
-14. Add a georeference to reveal the **GPS coordinate**; then upload the
-    unrelated test image to show the system answering **`NO_MATCH`**.
+### Demo setup
+
+```bash
+# 1. generate the synthetic dataset (once)
+python test_data/generate_test_data.py --out test_data/generated
+
+# 2. start both servers (two terminals)
+cd backend  && uvicorn app.main:app          # waits for warm-up, then serves :8000
+cd frontend && npm run dev                   # :5173
+```
+
+The backend runs a short warm-up on startup (SIFT / FLANN / thread pool / the
+embedding engine), so the *first* localization in the demo is as fast as the
+rest. Open <http://localhost:5173>.
+
+Assets and talking points:
+
+| Asset | File | Used for |
+|---|---|---|
+| Reference map | `test_data/generated/reference_map.jpg` | 3000×3000 synthetic aerial scene, 100 tiles |
+| Primary drone frame | `test_data/generated/test1_direct_crop.jpg` | the clean end-to-end match |
+| Rotated frame | `test_data/generated/test3_rotated_90.jpg` | rotation handling |
+| Unrelated frame | `test_data/generated/test8_unrelated.jpg` | the `NO_MATCH` answer |
+| Mission file | `test_data/generated/mission.plan` | mission-metadata panel |
+| Georeference | N `12.9760` · S `12.9580` · W `77.5880` · E `77.6080` | pixel → GPS |
+
+### Walkthrough
+
+1. **Upload the reference map.** Watch the indexing timer; the chip flips to
+   `READY` at 100 tiles. Optionally upload `mission.plan` for the metadata panel.
+2. **Upload `test1_direct_crop.jpg`** as the drone capture.
+3. **Click *Locate Drone*.** Follow the live pipeline panel — the elapsed clock,
+   the eight stages, and the per-stage detail line (which names the real
+   backend, e.g. *"backend: classical-embedding"*, *"2048 keypoints (sift)"*).
+4. Open **Processing** and step through all nine stage renders.
+5. Show **Enhanced** with the before/after toggle.
+6. Show the **Structural Terrain View** (read its disclaimer — visualization only).
+7. Show the detected **local features** and the backend chip (`SIFT`).
+8. Show the **top candidate regions** and click through to their map locations.
+9. Show the **correspondence lines**, then toggle to *RANSAC inliers only*.
+10. Show the **geometric verification** metrics and the 4×4 coverage grid.
+11. Show the **final polygon** projected on the full map.
+12. Show the **estimated drone centre** marker and the map-pixel readout.
+13. Open **Match Analysis**: the confidence decomposition (five weighted
+    meters), and the **decision margin** — for this frame it reads
+    *"unchallenged"* because the only other verified candidates are overlapping
+    tiles of the *same* spot, not rival locations.
+14. On the Dashboard, add the **georeference** above to reveal the **GPS
+    coordinate** and the metres-per-pixel readout. Then upload
+    `test8_unrelated.jpg` and run it again to show the system answering
+    **`NO_MATCH`** with a named reason. (For a bonus, `test3_rotated_90.jpg`
+    still localizes — SIFT is rotation-invariant.)
 
 ---
 
@@ -604,11 +683,12 @@ innovx-visualnav/
   elevation or 3D terrain model.
 - Position accuracy is bounded by reference map resolution and by the accuracy
   of the operator-supplied georeference.
-- The registry is in-process: uploads and jobs are lost when the backend
-  restarts. Embedding caches on disk survive, but a production deployment would
-  need a real store.
-- Runtime is a few seconds per frame on CPU. The prototype prioritises
-  correctness over real-time performance.
+- Jobs are in-process and lost on restart. Uploaded maps, drone frames and
+  plans are mirrored to a JSON sidecar and restored on startup (when their files
+  and embedding cache are still present); a production deployment would still
+  want a real store.
+- Runtime is ~1–2 seconds per frame on CPU with the classical backend. The
+  prototype prioritises correctness over real-time performance.
 
 ---
 

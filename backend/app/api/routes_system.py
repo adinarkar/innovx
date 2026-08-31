@@ -33,6 +33,7 @@ async def system_info(warm: bool = False) -> SystemInfoResponse:
         settings={
             "top_k_candidates": settings.top_k_candidates,
             "max_keypoints": settings.max_keypoints,
+            "min_query_keypoints": settings.min_query_keypoints,
             "matcher": settings.matcher,
             "tile_scales": settings.tile_scales,
             "tile_overlap": settings.tile_overlap,

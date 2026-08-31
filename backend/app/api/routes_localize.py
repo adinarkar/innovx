@@ -3,7 +3,6 @@ from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException
 
-from app.config import settings
 from app.logging_config import get_logger
 from app.localization.geolocation import Georeference, GeoreferenceError
 from app.schemas import (CandidatesResponse, GeoreferenceRequest, GeoreferenceResponse,
@@ -38,16 +37,14 @@ async def localize(req: LocalizeRequest) -> JobAccepted:
     if req.plan_id and registry.get_plan(req.plan_id) is None:
         raise HTTPException(status_code=400, detail=f"Unknown plan_id '{req.plan_id}'.")
 
-    # Per-request overrides of the runtime matcher / rotation policy.
-    if req.matcher:
-        if req.matcher.lower() not in ("lightglue", "sift"):
-            raise HTTPException(status_code=400,
-                                detail="matcher must be 'lightglue' or 'sift'.")
-        settings.matcher = req.matcher.lower()
-    if req.rotation_search is not None:
-        settings.rotation_search = bool(req.rotation_search)
+    # Per-request overrides are passed straight through to the job; the global
+    # settings singleton is never mutated (it is shared across all requests).
+    if req.matcher and req.matcher.lower() not in ("lightglue", "sift"):
+        raise HTTPException(status_code=400,
+                            detail="matcher must be 'lightglue' or 'sift'.")
 
-    job = start_job(req.map_id, req.drone_id, req.plan_id, req.top_k, req.calibration)
+    job = start_job(req.map_id, req.drone_id, req.plan_id, req.top_k, req.calibration,
+                    matcher=req.matcher, rotation_search=req.rotation_search)
     return JobAccepted(job_id=job.job_id, state=job.state,
                        poll_url=f"/api/process/{job.job_id}")
 
@@ -100,6 +97,7 @@ async def georeference(req: GeoreferenceRequest) -> GeoreferenceResponse:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     rec.georeference = geo
+    registry.touch()
     log.info("Map %s georeferenced (%s).", rec.map_id, geo.kind)
     return GeoreferenceResponse(map_id=rec.map_id, georeference=geo.to_dict())
 
@@ -110,4 +108,5 @@ async def clear_georeference(map_id: str) -> dict:
     if rec is None:
         raise HTTPException(status_code=404, detail=f"Unknown map_id '{map_id}'.")
     rec.georeference = None
+    registry.touch()
     return {"status": "success", "map_id": map_id, "georeferenced": False}

@@ -5,6 +5,14 @@ import { Chip, StatusBadge } from './Badge'
 import { fileUrl, apiUrl } from '../services/api'
 import { coord, number, percent, px, rejectionLabel, STATUS_META } from '../utils/format'
 
+/** One line under the big confidence number, so the figure is never read out of context. */
+const CONFIDENCE_CAPTION = {
+  MATCH_FOUND: 'of the verified match',
+  LOW_CONFIDENCE: 'below the 0.60 reporting threshold',
+  AMBIGUOUS: 'best candidate — not a unique fix',
+  NO_MATCH: 'no region passed verification',
+}
+
 /**
  * Headline result: status, confidence, the metric grid and the full map with
  * the matched region highlighted (spec sections 30 and 31).
@@ -13,7 +21,9 @@ export default function ResultPanel({ result, mapInfo }) {
   const [layers, setLayers] = useState({
     polygon: true,
     center: true,
-    candidates: false,
+    // For an ambiguous frame there is no single region to trust - surface the
+    // competing candidate windows instead.
+    candidates: result?.status === 'AMBIGUOUS',
     keypoints: false,
   })
 
@@ -65,6 +75,9 @@ export default function ResultPanel({ result, mapInfo }) {
               ].join(' ')}
             >
               {percent(result.confidence, 1)}
+            </div>
+            <div className="mt-0.5 text-[11px] text-ink-muted">
+              {CONFIDENCE_CAPTION[result.status] || ''}
             </div>
             <div className="mt-0.5 text-[11px] text-ink-muted">
               {number(result.processing_time, 2)}s · {result.engine?.device}
@@ -171,7 +184,9 @@ export default function ResultPanel({ result, mapInfo }) {
             </figure>
           ) : (
             <div className="grid h-[300px] place-items-center rounded-xl border border-dashed border-ink-line bg-brand-bg/30 px-6 text-center text-[12.5px] text-ink-muted">
-              No localized region — the pipeline did not accept a match.
+              {result.status === 'AMBIGUOUS'
+                ? 'Ambiguous — the frame matches more than one region. Compare the candidate windows on the map.'
+                : 'No localized region — the pipeline did not accept a match.'}
             </div>
           )}
 
