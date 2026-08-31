@@ -27,9 +27,13 @@ from app.localization import dino, homography as hg, visualization as viz
 from app.localization import semantic
 from app.localization.domain_translation import get_translation_engine
 from app.localization.imaging import fit_long_edge, imread
-from app.localization.confidence import (CandidateScore, ClusterScore, MatchStatus,
+from app.localization.confidence import (CandidateScore, ClusterScore, ConsensusResult,
+                                         MatchStatus, RepresentationScore,
                                          cluster_candidates, decide, evaluate_candidate,
-                                         finalize_scores, score_clusters, status_message)
+                                         finalize_scores, normalised_weights,
+                                         representation_consensus,
+                                         representation_geometric_score,
+                                         score_clusters, status_message)
 from app.localization.lightglue import (MatchResult, extract_features, match_features,
                                         rotate_image, unrotate_points)
 from app.localization.preprocessing import (CameraCalibration, PreprocessResult,
@@ -120,6 +124,7 @@ class CandidateEvaluation:
     polygon: Optional[np.ndarray] = None
     center: Optional[np.ndarray] = None
     tile_image: Optional[np.ndarray] = None
+    tile_scale: float = 1.0
     query_pts_work: Optional[np.ndarray] = None
     target_pts_work: Optional[np.ndarray] = None
     inlier_map_points: Optional[np.ndarray] = None   # inliers in map pixels
@@ -417,6 +422,7 @@ def localize(record: MapRecord, drone_path: Path, job_dir: Path,
                                    hom, rotation_used)
         ev = CandidateEvaluation(cand_idx + 1, tile, hit["similarity"], score, hom,
                                  match, rotation_used, tile_image=tile_img,
+                                 tile_scale=tile_scale,
                                  query_pts_work=match.query_pts,
                                  target_pts_work=match.target_pts,
                                  retrieval_sources=list(hit.get("sources", ["rgb"])),
@@ -480,7 +486,16 @@ def localize(record: MapRecord, drone_path: Path, job_dir: Path,
     agg_center, agg_polygon = (
         _aggregate_geometry(best_cluster.member_candidate_ids, by_id)
         if best_cluster is not None else (None, None))
+    timings["position"] = time.time() - t0
 
+    # ---- 9b. per-representation matching + consensus (spec Phases 6 & 8) --
+    t0 = time.time()
+    rep_scores, consensus = _cross_representation(
+        representations, structural_obj, cluster_scores, best_cluster, best,
+        by_id, agg_center, same_place_px, work_w, work_h, dw, dh, stage)
+    timings["consensus"] = time.time() - t0
+
+    t0 = time.time()
     renders = _render_all(job_dir, record, map_img, drone_img, pre, work_img,
                           query_feats, evaluations, best, accepted,
                           agg_polygon, agg_center, structural_obj, representations)
@@ -488,6 +503,10 @@ def localize(record: MapRecord, drone_path: Path, job_dir: Path,
                            evaluations, renders, drone_img, pre, query_feats,
                            map_w, map_h, timings, t_start, engine,
                            agg_center, agg_polygon, cluster_scores)
+    result["representation_scores"] = [s.to_dict() for s in rep_scores]
+    result["consensus"] = consensus.to_dict() if consensus is not None else None
+    result["cross_representation_agreement"] = (
+        bool(consensus.agree) if consensus is not None else None)
     result["representations"] = {
         "available": [k for k in representations if k in ("rgb", "structural", "map")],
         "branches": rep_meta,
@@ -501,7 +520,7 @@ def localize(record: MapRecord, drone_path: Path, job_dir: Path,
         },
     }
     result["preprocessing"] = result["preprocessing"] | rep_stats
-    timings["position"] = time.time() - t0
+    timings["render"] = time.time() - t0
     stage("position", STAGES[7][1], "done", status_message(status))
     result["timings"] = {k: round(v, 3) for k, v in timings.items()}
     result["processing_time"] = round(time.time() - t_start, 2)
@@ -583,6 +602,172 @@ def _aggregate_geometry(member_candidate_ids: List[int],
     polygons = np.array([m.polygon for m in members], dtype=np.float64)  # (N, 4, 2)
     polygon = (polygons * weights[:, None, None]).sum(axis=0)
     return center, polygon
+
+
+def _cross_representation(representations: Dict[str, np.ndarray], structural_obj,
+                         cluster_scores: List[ClusterScore],
+                         best_cluster: Optional[ClusterScore],
+                         best: Optional["CandidateEvaluation"],
+                         by_id: Dict[int, "CandidateEvaluation"],
+                         agg_center: Optional[np.ndarray], same_place_px: float,
+                         work_w: int, work_h: int, dw: int, dh: int, stage
+                         ) -> Tuple[List[RepresentationScore], Optional[ConsensusResult]]:
+    """
+    Independently match the structural / map representations against the
+    winning location's candidate tiles and check whether they agree with the
+    RGB fix (spec Phases 6 & 8).
+
+    This produces *evidence*, not a new decision: the returned scores and
+    consensus flag are reported and (in the fusion step) may nudge confidence,
+    but a disagreeing translated-map branch can never move or create a fix -
+    the RGB geometric branch keeps sole authority over the position.
+    """
+    if best_cluster is None or best is None:
+        stage("consensus", "Checking representation agreement...", "skipped",
+              "no verified location to corroborate")
+        return [], None
+
+    try:
+        refine_ids: List[int] = []
+        for c in cluster_scores[:2]:
+            refine_ids.extend(c.member_candidate_ids)
+        members = [by_id[i] for i in dict.fromkeys(refine_ids) if i in by_id]
+        valid = [m for m in members if m.hom.ok and m.hom.plausible]
+        members = (valid or members)
+        members.sort(key=lambda m: m.score.geometric_score, reverse=True)
+        members = members[:max(1, settings.representation_matching_top_n)]
+
+        estimates = _representation_estimates(representations, structural_obj, members,
+                                              work_w, work_h, dw, dh)
+
+        present = ["rgb"] + sorted(estimates) + ["retrieval"]
+        weights = normalised_weights(present)
+
+        ref_center = agg_center if agg_center is not None else best.center
+        positions: Dict[str, Tuple[float, float]] = {}
+        if ref_center is not None:
+            positions["rgb"] = (float(ref_center[0]), float(ref_center[1]))
+
+        scores: List[RepresentationScore] = [RepresentationScore(
+            representation="rgb",
+            retrieval_similarity=float(best_cluster.dino_similarity),
+            total_matches=int(best_cluster.raw_matches),
+            inliers=int(best_cluster.inliers),
+            inlier_ratio=float(best_cluster.inlier_ratio),
+            reprojection_error=best_cluster.reprojection_error,
+            homography_plausible=bool(best_cluster.homography_valid),
+            geometric_score=float(best_cluster.geometric_score),
+            weight=float(weights.get("rgb", 0.0)),
+            map_center=positions.get("rgb"),
+        )]
+
+        for name, (hom, center) in estimates.items():
+            if center is not None and hom.ok and hom.plausible:
+                positions[name] = (float(center[0]), float(center[1]))
+            scores.append(RepresentationScore(
+                representation=name,
+                total_matches=int(hom.raw_matches),
+                inliers=int(hom.inliers),
+                inlier_ratio=float(hom.inlier_ratio),
+                reprojection_error=(float(hom.reprojection_error)
+                                    if np.isfinite(hom.reprojection_error) else None),
+                homography_plausible=bool(hom.ok and hom.plausible),
+                geometric_score=representation_geometric_score(hom),
+                weight=float(weights.get(name, 0.0)),
+                map_center=(positions.get(name)),
+            ))
+
+        tol = (settings.representation_consensus_px
+               if settings.representation_consensus_px > 0 else same_place_px)
+        consensus = representation_consensus(positions, tol)
+
+        agree_names = [n for n in consensus.participating if n != "rgb"]
+        if not agree_names:
+            detail = "no auxiliary representation produced a verified estimate"
+        elif consensus.agree:
+            detail = (f"{', '.join(agree_names)} agree with RGB within "
+                      f"{consensus.tolerance_px:.0f}px "
+                      f"(max {consensus.max_disagreement_px:.0f}px)")
+        else:
+            detail = (f"representations disagree - max {consensus.max_disagreement_px:.0f}px "
+                      f"> {consensus.tolerance_px:.0f}px tolerance")
+        stage("consensus", "Checking representation agreement...", "done", detail)
+        return scores, consensus
+    except Exception as exc:  # failure-safe
+        log.warning("Cross-representation consensus failed (%s) - skipping.", exc)
+        stage("consensus", "Checking representation agreement...", "skipped", str(exc))
+        return [], None
+
+
+def _match_one_representation(rep_work: np.ndarray, rep_feats: FeatureSet,
+                              rep_scale: float, members: List["CandidateEvaluation"],
+                              work_w: int, work_h: int, dw: int, dh: int
+                              ) -> Tuple[hg.HomographyResult, Optional[np.ndarray]]:
+    """
+    Match one representation's working image against each top candidate tile
+    independently and keep the strongest verified geometry.
+
+    The representation's own feature points are verified on their own - they
+    are never merged with the RGB correspondences before RANSAC (spec Phase 6).
+    """
+    best_hom = hg.HomographyResult(ok=False)
+    best_center: Optional[np.ndarray] = None
+    best_rank = (-1, -1)
+    for ev in members:
+        if ev.tile is None or ev.tile_image is None:
+            continue
+        k = ev.rotation
+        if k:
+            q_img = rotate_image(rep_work, k)
+            try:
+                q_feats = extract_features(q_img)
+            except Exception:
+                continue
+            hom, _m = _evaluate(q_img, q_feats, ev.tile_image, rotation=k,
+                                canonical_size=(work_w, work_h))
+        else:
+            hom, _m = _evaluate(rep_work, rep_feats, ev.tile_image, rotation=0,
+                                canonical_size=(work_w, work_h))
+        rank = (1 if (hom.ok and hom.plausible) else 0, hom.inliers)
+        if rank <= best_rank:
+            continue
+        best_rank = rank
+        best_hom = hom
+        best_center = None
+        if hom.ok and hom.H is not None:
+            H_full = hg.scale_homography(hom.H, rep_scale, ev.tile_scale)
+            H_map = hg.translate_homography(H_full, ev.tile.x, ev.tile.y)
+            best_center = hg.transform_points(
+                H_map, np.array([[dw / 2.0, dh / 2.0]]))[0]
+    return best_hom, best_center
+
+
+def _representation_estimates(representations: Dict[str, np.ndarray],
+                              structural_obj, members: List["CandidateEvaluation"],
+                              work_w: int, work_h: int, dw: int, dh: int
+                              ) -> Dict[str, Tuple[hg.HomographyResult, Optional[np.ndarray]]]:
+    """Independent structural / map-domain estimates for the winning location."""
+    rep_imgs: Dict[str, np.ndarray] = {}
+    if structural_obj is not None and "structural" in representations:
+        rep_imgs["structural"] = representations["structural"]
+    if "map" in representations:
+        rep_imgs["map"] = representations["map"]
+    if not rep_imgs or not members:
+        return {}
+
+    out: Dict[str, Tuple[hg.HomographyResult, Optional[np.ndarray]]] = {}
+    for name, img in rep_imgs.items():
+        try:
+            rep_work, rep_scale = _prepare_work_image(img)
+            rep_feats = extract_features(rep_work)
+            hom, center = _match_one_representation(rep_work, rep_feats, rep_scale,
+                                                   members, work_w, work_h, dw, dh)
+            out[name] = (hom, center)
+            log.info("Representation '%s': %d inliers, plausible=%s.",
+                     name, hom.inliers, hom.ok and hom.plausible)
+        except Exception as exc:
+            log.warning("Representation '%s' matching failed (%s) - skipping.", name, exc)
+    return out
 
 
 def _project_inliers(ev: "CandidateEvaluation", work_scale: float,

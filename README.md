@@ -442,6 +442,23 @@ it (`retrieval_sources` in the API, shown in the Candidates tab), and the
 `retrieval` block reports `candidate_count`, `best_similarity`, `sources` and
 `multi_domain`. Default off — the RGB shortlist alone is unchanged.
 
+### Representation-level verification and consensus
+
+The `REPRESENTATION_MATCHING_TOP_N` strongest RGB-verified candidates for the
+winning location also get the structural and map representations matched and
+RANSAC-verified against them **independently** — feature points from different
+representations are never merged before geometric validation. The `consensus`
+stage then compares each representation's projected map centre against the RGB
+estimate: `agree` is true when every auxiliary branch lands within
+`REPRESENTATION_CONSENSUS_PX` (or the derived frame-footprint tolerance). The
+API returns `representation_scores` (per-branch inliers / inlier ratio /
+reprojection error / homography validity / geometric score / fusion weight) and
+a `consensus` block (`agree`, `tolerance_px`, `max_disagreement_px`,
+`offsets_px`), shown in the result panel's **Cross-Representation Evidence**
+table. This is evidence only in this milestone — the RGB branch keeps sole
+authority over the position; fusion into the confidence number lands in the
+next milestone.
+
 ### Sat2Maps training
 
 Training is fully separate from the server (`backend/training/sat2map/`, see its
@@ -600,6 +617,7 @@ All settings are environment variables with defaults — see `.env.example`.
 | `MAP_DOMAIN_RETRIEVAL_ENABLED` | `false` | Also retrieve DINO candidates from the map/structural representations and union them with the RGB shortlist |
 | `MAP_DOMAIN_TOP_K` | `10` | Shortlist size for each auxiliary retrieval branch |
 | `CANDIDATE_UNION_MAX` | `18` | Cap on the de-duplicated unioned shortlist |
+| `REPRESENTATION_MATCHING_TOP_N` | `3` | Strongest RGB-verified candidates that also get independent structural/map matching |
 | `REPRESENTATION_CONSENSUS_PX` | `0` | Agreement tolerance in map px (`0` = derive from frame footprint) |
 | `RGB_WEIGHT` / `STRUCTURAL_WEIGHT` / `SAT2MAP_WEIGHT` / `RETRIEVAL_WEIGHT` | `0.40 / 0.25 / 0.15 / 0.20` | Initial, configurable fusion weights (normalised at use) |
 | `REFERENCE_MAP_TYPE` | `unknown` | `satellite` / `roadmap` / `terrain` / `unknown` hint |

@@ -439,6 +439,137 @@ def score_clusters(clusters: List[List[CandidateScore]]) -> List[ClusterScore]:
     return ordered
 
 
+# --------------------------------------------------------------------------
+# Cross-representation evidence (spec Phases 6 & 8)
+# --------------------------------------------------------------------------
+@dataclass
+class RepresentationScore:
+    """
+    Measurable, per-representation verification evidence for one map location.
+
+    Every field is a real geometric statistic - nothing here is a fabricated
+    "AI confidence". ``weight`` is the fusion weight this representation carries
+    (from config, normalised across the representations actually present).
+    """
+    representation: str
+    retrieval_similarity: float = 0.0
+    total_matches: int = 0
+    inliers: int = 0
+    inlier_ratio: float = 0.0
+    reprojection_error: Optional[float] = None
+    homography_plausible: bool = False
+    geometric_score: float = 0.0
+    weight: float = 0.0
+    map_center: Optional[Tuple[float, float]] = None
+
+    def to_dict(self) -> dict:
+        return {
+            "representation": self.representation,
+            "retrieval_similarity": round(float(self.retrieval_similarity), 4),
+            "total_matches": int(self.total_matches),
+            "inliers": int(self.inliers),
+            "inlier_ratio": round(float(self.inlier_ratio), 4),
+            "reprojection_error": (round(float(self.reprojection_error), 3)
+                                   if self.reprojection_error is not None else None),
+            "homography_plausible": bool(self.homography_plausible),
+            "geometric_score": round(float(self.geometric_score), 4),
+            "weight": round(float(self.weight), 4),
+            "map_center": ([round(float(self.map_center[0]), 1),
+                            round(float(self.map_center[1]), 1)]
+                           if self.map_center is not None else None),
+        }
+
+
+def representation_geometric_score(hom: HomographyResult, similarity: float = 0.0) -> float:
+    """Same measurable components as a candidate score, condensed to one number."""
+    valid = bool(hom.ok and hom.plausible)
+    err = float(hom.reprojection_error) if np.isfinite(hom.reprojection_error) else None
+    comp = (0.45 * inlier_score(hom.inliers, hom.inlier_ratio)
+            + 0.35 * geometry_score(err, hom.shear, valid)
+            + 0.20 * coverage_score(hom.spatial_coverage))
+    if not valid:
+        comp *= 0.25
+    return _clamp01(comp)
+
+
+def normalised_weights(present: List[str]) -> Dict[str, float]:
+    """
+    Config fusion weights (RGB/structural/map/retrieval), renormalised over the
+    representations actually available so they always sum to 1.0.
+    """
+    raw = {
+        "rgb": max(0.0, settings.rgb_weight),
+        "structural": max(0.0, settings.structural_weight),
+        "map": max(0.0, settings.sat2map_weight),
+        "retrieval": max(0.0, settings.retrieval_weight),
+    }
+    active = {k: raw.get(k, 0.0) for k in present}
+    total = sum(active.values())
+    if total <= 0:
+        return {k: 1.0 / len(active) for k in active} if active else {}
+    return {k: v / total for k, v in active.items()}
+
+
+@dataclass
+class ConsensusResult:
+    """
+    Do the independent representations place the drone in the same spot?
+
+    ``reference`` is always the RGB/geometric branch - it has the highest
+    safety priority, so agreement is measured as every other representation's
+    distance from the RGB estimate, never a free-floating average.
+    """
+    reference: str = "rgb"
+    agree: bool = True
+    tolerance_px: float = 0.0
+    max_disagreement_px: float = 0.0
+    offsets_px: Dict[str, float] = field(default_factory=dict)
+    positions: Dict[str, Tuple[float, float]] = field(default_factory=dict)
+    participating: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {
+            "reference": self.reference,
+            "agree": bool(self.agree),
+            "tolerance_px": round(float(self.tolerance_px), 1),
+            "max_disagreement_px": round(float(self.max_disagreement_px), 1),
+            "offsets_px": {k: round(float(v), 1) for k, v in self.offsets_px.items()},
+            "positions": {k: [round(float(p[0]), 1), round(float(p[1]), 1)]
+                          for k, p in self.positions.items()},
+            "participating": list(self.participating),
+        }
+
+
+def representation_consensus(positions: Dict[str, Tuple[float, float]],
+                             tolerance_px: float,
+                             reference: str = "rgb") -> ConsensusResult:
+    """
+    Compare every representation's projected map centre against the reference.
+
+    ``agree`` is True when every other representation lands within
+    ``tolerance_px`` of the reference (or when only the reference is present -
+    a single branch cannot disagree with itself). Independent agreement is
+    strong evidence; a translated-map branch that points somewhere else is a
+    warning, not a vote to move the fix.
+    """
+    res = ConsensusResult(reference=reference, tolerance_px=float(tolerance_px),
+                          positions=dict(positions),
+                          participating=sorted(positions))
+    ref = positions.get(reference)
+    if ref is None or len(positions) < 2:
+        return res
+    max_off = 0.0
+    for name, p in positions.items():
+        if name == reference:
+            continue
+        d = float(np.hypot(p[0] - ref[0], p[1] - ref[1]))
+        res.offsets_px[name] = d
+        max_off = max(max_off, d)
+    res.max_disagreement_px = max_off
+    res.agree = max_off <= float(tolerance_px)
+    return res
+
+
 def decide(scores: List[ClusterScore]) -> tuple[MatchStatus, str]:
     """
     Turn the ranked locations into a status plus a human-readable explanation.

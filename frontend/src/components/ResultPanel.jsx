@@ -100,6 +100,73 @@ export default function ResultPanel({ result, mapInfo }) {
                     hint="Confidence-weighted average across supporting tiles" />
       </div>
 
+      {/* ---- cross-representation agreement ---- */}
+      {result.representation_scores?.length > 0 && (
+        <div className="card card-pad">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="section-title">Cross-Representation Evidence</div>
+            {result.consensus && result.consensus.participating?.length > 1 ? (
+              <Chip tone={result.cross_representation_agreement ? 'ok' : 'bad'}>
+                {result.cross_representation_agreement ? 'AGREEMENT: YES' : 'AGREEMENT: NO'}
+              </Chip>
+            ) : (
+              <Chip tone="neutral">RGB ONLY</Chip>
+            )}
+          </div>
+          <p className="mt-1 text-[12px] leading-relaxed text-ink-muted">
+            Each representation is matched and geometrically verified independently.
+            The RGB/geometric branch keeps sole authority over the position — an
+            auxiliary branch that disagrees lowers confidence but never moves the fix.
+          </p>
+          <div className="mt-3 overflow-x-auto">
+            <table className="w-full text-left text-[12px]">
+              <thead className="text-ink-muted">
+                <tr className="border-b border-ink-line">
+                  <th className="py-1.5 pr-4 font-medium">Representation</th>
+                  <th className="py-1.5 pr-4 font-medium">Inliers</th>
+                  <th className="py-1.5 pr-4 font-medium">Inlier ratio</th>
+                  <th className="py-1.5 pr-4 font-medium">Reproj. err</th>
+                  <th className="py-1.5 pr-4 font-medium">Homography</th>
+                  <th className="py-1.5 pr-4 font-medium">Geom. score</th>
+                  <th className="py-1.5 pr-4 font-medium">Weight</th>
+                  <th className="py-1.5 font-medium">Offset from RGB</th>
+                </tr>
+              </thead>
+              <tbody className="font-mono tabular-nums text-ink">
+                {result.representation_scores.map((s) => (
+                  <tr key={s.representation} className="border-b border-ink-line/60">
+                    <td className="py-1.5 pr-4 uppercase">{s.representation}</td>
+                    <td className="py-1.5 pr-4">{number(s.inliers)}</td>
+                    <td className="py-1.5 pr-4">{percent(s.inlier_ratio)}</td>
+                    <td className="py-1.5 pr-4">
+                      {s.reprojection_error === null ? '--' : px(s.reprojection_error)}
+                    </td>
+                    <td className={`py-1.5 pr-4 ${s.homography_plausible ? 'text-state-ok' : 'text-state-bad'}`}>
+                      {s.homography_plausible ? 'valid' : 'rejected'}
+                    </td>
+                    <td className="py-1.5 pr-4">{percent(s.geometric_score)}</td>
+                    <td className="py-1.5 pr-4">{percent(s.weight)}</td>
+                    <td className="py-1.5">
+                      {s.representation === 'rgb'
+                        ? 'reference'
+                        : result.consensus?.offsets_px?.[s.representation] != null
+                          ? `${px(result.consensus.offsets_px[s.representation])}`
+                          : '--'}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          {result.consensus && result.consensus.participating?.length > 1 && (
+            <p className="mt-2 font-mono text-[11px] text-ink-muted">
+              tolerance {px(result.consensus.tolerance_px)} · max disagreement{' '}
+              {px(result.consensus.max_disagreement_px)}
+            </p>
+          )}
+        </div>
+      )}
+
       {/* ---- GPS ---- */}
       <div className="card card-pad">
         <div className="flex flex-wrap items-start justify-between gap-4">

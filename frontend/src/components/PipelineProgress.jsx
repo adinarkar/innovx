@@ -16,6 +16,7 @@ const PIPELINE = [
   ['features', 'Extracting local features'],
   ['match', 'Matching structural features'],
   ['verify', 'Running geometric verification'],
+  ['consensus', 'Checking representation agreement'],
   ['position', 'Estimating position'],
 ]
 
