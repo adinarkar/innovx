@@ -476,8 +476,14 @@ def localize(record: MapRecord, drone_path: Path, job_dir: Path,
     # ---- 9. position + renders ------------------------------------------
     stage(*STAGES[7])
     t0 = time.time()
-    best_cluster = next((c for c in cluster_scores if c.homography_valid),
-                        cluster_scores[0] if cluster_scores else None)
+    # Prefer a verified cluster; if none verified, fall back to the best
+    # *partial* one (structural gates passed, only the strength thresholds
+    # missed) so the "Matched features" view and result map show the actual
+    # near-miss tile rather than an arbitrary rejected one. Still NO_MATCH.
+    best_cluster = (
+        next((c for c in cluster_scores if c.homography_valid), None)
+        or next((c for c in cluster_scores if c.partial), None)
+        or (cluster_scores[0] if cluster_scores else None))
     best = by_id.get(best_cluster.representative_id) if best_cluster else None
     accepted = status in (MatchStatus.MATCH_FOUND, MatchStatus.LOW_CONFIDENCE)
 
@@ -958,6 +964,8 @@ def _build_result(record: MapRecord, status: MatchStatus, explanation: str,
             "reprojection_error": (cluster_dict["reprojection_error"] if cluster_dict
                                    else hom_dict["reprojection_error"]),
             "homography_valid": hom_dict["homography_valid"],
+            "verdict": (cluster_dict["verdict"] if cluster_dict else hom_dict["verdict"]),
+            "partial": bool(cluster_dict["partial"] if cluster_dict else hom_dict["partial"]),
             "coverage_cells": hom_dict["coverage_cells"],
             "coverage_grid": hom_dict["coverage_grid"],
             "rejection": cluster_dict["rejection"] if cluster_dict else hom_dict["rejection"],

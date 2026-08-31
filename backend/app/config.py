@@ -68,6 +68,11 @@ class Settings(BaseSettings):
     max_reprojection_error: float = 12.0
     min_spatial_coverage: float = 0.25
     coverage_grid: int = 4          # 4x4 grid, see spec section 18
+    # Convexity gate: reject a homography that folds the drone frame into a
+    # self-intersecting (non-convex) quadrilateral. Sound for RGB->RGB, but
+    # too strict for sparse cross-domain (RGB photo -> rendered roadmap)
+    # matches. Set CONVEXITY_GATE_ENABLED=false in .env to disable it.
+    convexity_gate_enabled: bool = True
 
     # --- decision thresholds ---
     match_confidence: float = 0.60

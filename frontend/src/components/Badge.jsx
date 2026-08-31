@@ -33,3 +33,25 @@ export function BoolBadge({ value, trueLabel = 'VALID', falseLabel = 'REJECTED' 
     </span>
   )
 }
+
+const VERDICT_META = {
+  verified: { label: 'VERIFIED', tone: 'ok' },
+  partial: { label: 'PARTIAL', tone: 'warn' },
+  rejected: { label: 'REJECTED', tone: 'bad' },
+}
+
+/**
+ * Three-state candidate outcome: verified / partial / rejected.
+ * `partial` = every structural gate passed, only a strength threshold missed.
+ * Falls back to the boolean `homography_valid` for older payloads.
+ */
+export function VerdictBadge({ verdict, valid }) {
+  const key = verdict || (valid ? 'verified' : 'rejected')
+  const meta = VERDICT_META[key] || VERDICT_META.rejected
+  return (
+    <span className={`chip ${TONES[meta.tone]}`}>
+      <span className="h-1.5 w-1.5 rounded-full bg-current" />
+      {meta.label}
+    </span>
+  )
+}

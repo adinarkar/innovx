@@ -5,7 +5,7 @@ import ImageFrame from '../components/ImageFrame'
 import MapViewer from '../components/MapViewer'
 import MetricCard from '../components/MetricCard'
 import EmptyState from '../components/EmptyState'
-import { BoolBadge, Chip, StatusBadge } from '../components/Badge'
+import { BoolBadge, Chip, StatusBadge, VerdictBadge } from '../components/Badge'
 import { useApp } from '../hooks/useAppState'
 import { apiUrl, fileUrl } from '../services/api'
 import { bytes, number, percent, px, rejectionLabel } from '../utils/format'
@@ -380,8 +380,13 @@ function StageCandidates({ result, mapInfo }) {
                       retrieved via: {c.retrieval_sources.join(' + ')}
                     </div>
                   )}
+                {(c.verdict === 'partial' || (!c.homography_valid && c.partial)) && c.rejection && (
+                  <div className="mt-0.5 text-[10.5px] text-state-warn">
+                    partial: {rejectionLabel(c.rejection)}
+                  </div>
+                )}
               </div>
-              <BoolBadge value={c.homography_valid} />
+              <VerdictBadge verdict={c.verdict} valid={c.homography_valid} />
             </button>
           ))}
         </div>
@@ -408,6 +413,10 @@ function StageMatches({ result }) {
   const [inliersOnly, setInliersOnly] = useState(false)
   const m = result.feature_metrics
   const src = inliersOnly ? result.renders.matches_inliers : result.renders.matches_raw
+  const tileId = result.best_candidate?.tile_id
+  const tileNote = tileId != null
+    ? `Left: drone capture. Right: candidate tile ${tileId}${m.verdict === 'partial' ? ' (partial — near miss)' : ''}.`
+    : 'Left: drone capture. Right: candidate tile.'
 
   return (
     <section className="card card-pad">
@@ -430,7 +439,7 @@ function StageMatches({ result }) {
       />
       {src ? (
         <ImageFrame src={fileUrl(src)} alt="Feature correspondences" aspect="aspect-[21/9]"
-                    caption="Left: drone capture. Right: candidate tile." />
+                    caption={tileNote} />
       ) : (
         <div className="grid h-64 place-items-center rounded-xl border border-dashed border-ink-line text-[13px] text-ink-muted">
           No correspondence render — the matcher produced no usable matches.
@@ -457,7 +466,7 @@ function StageVerification({ result }) {
         number="08"
         title="Geometric Verification"
         description="RANSAC estimates a homography from the correspondences, and the result is only accepted if it also passes convexity, scale, shear and coverage gates."
-        aside={<BoolBadge value={m.homography_valid} />}
+        aside={<VerdictBadge verdict={m.verdict} valid={m.homography_valid} />}
       />
       <div className="grid gap-4 lg:grid-cols-[1.6fr_1fr]">
         <div className="grid gap-3 sm:grid-cols-2">
@@ -467,8 +476,9 @@ function StageVerification({ result }) {
           <MetricCard label="Reprojection Error"
                       value={m.reprojection_error === null ? '--' : px(m.reprojection_error)} />
           <MetricCard label="Spatial Coverage" value={percent(m.spatial_coverage)} />
-          <MetricCard label="Homography" value={m.homography_valid ? 'VALID' : 'REJECTED'}
-                      tone={m.homography_valid ? 'ok' : 'bad'}
+          <MetricCard label="Homography"
+                      value={m.homography_valid ? 'VALID' : m.verdict === 'partial' ? 'PARTIAL' : 'REJECTED'}
+                      tone={m.homography_valid ? 'ok' : m.verdict === 'partial' ? 'warn' : 'bad'}
                       hint={rejectionLabel(m.rejection) || 'All plausibility gates passed'} />
         </div>
 

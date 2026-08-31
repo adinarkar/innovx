@@ -35,6 +35,7 @@ class HomographyResult:
     coverage_cells: int = 0
     coverage_grid: int = settings.coverage_grid
     plausible: bool = False
+    partial: bool = False        # failed only a strength threshold, not a structural gate
     rejection: Optional[str] = None
     corners: Optional[np.ndarray] = None      # (4, 2) projected frame outline
     center: Optional[np.ndarray] = None       # (2,) projected frame centre
@@ -46,6 +47,9 @@ class HomographyResult:
     def to_dict(self) -> dict:
         return {
             "homography_valid": bool(self.ok and self.plausible),
+            "verdict": ("verified" if (self.ok and self.plausible)
+                        else "partial" if self.partial else "rejected"),
+            "partial": bool(self.partial),
             "raw_matches": int(self.raw_matches),
             "ransac_inliers": int(self.inliers),
             "inlier_ratio": round(float(self.inlier_ratio), 4),
@@ -203,48 +207,67 @@ def estimate(query_pts: np.ndarray, target_pts: np.ndarray,
     res.scale_ratio = polygon_area(corners) / max(query_area, 1e-6)
 
     res.ok = True
-    res.plausible, res.rejection = _plausibility(res, corners, scale, shear)
+    res.plausible, res.rejection, res.partial = _plausibility(res, corners, scale, shear)
     return res
 
 
+# Strength thresholds - a candidate that clears every structural gate but
+# falls short here is reported as "partial" (see backend/turnedoff.txt),
+# not flatly rejected: the geometry is a plausible aerial view, there is
+# just not yet enough evidence to accept it as a fix.
+_SOFT_GATES = frozenset({
+    "below_min_inliers", "below_min_inlier_ratio",
+    "reprojection_error_too_high", "features_too_concentrated",
+})
+
+
 def _plausibility(res: HomographyResult, corners: np.ndarray,
-                  scale: float, shear: float) -> Tuple[bool, Optional[str]]:
+                  scale: float, shear: float) -> Tuple[bool, Optional[str], bool]:
     """
-    Hard geometric sanity gates.  These are structural, not confidence-based:
-    failing any one of them means the transform cannot describe a planar
-    aerial view, whatever the score says.
+    Geometric sanity gates.
+
+    Returns ``(plausible, rejection, partial)``.  Structural gates
+    ("this transform cannot describe a planar aerial view") produce a hard
+    rejection.  The strength thresholds in ``_SOFT_GATES`` instead produce
+    ``partial=True``: the frame projects sanely, the match is just weak.
     """
+    reason: Optional[str] = None
     if not np.all(np.isfinite(corners)):
-        return False, "non_finite_projection"
-    if not is_convex(corners):
-        return False, "non_convex_projection"
-    if scale <= 1e-3 or not np.isfinite(scale):
-        return False, "degenerate_scale"
+        reason = "non_finite_projection"
+    # Convexity gate - toggleable via settings.convexity_gate_enabled
+    # (CONVEXITY_GATE_ENABLED in .env). See backend/turnedoff.txt.
+    elif settings.convexity_gate_enabled and not is_convex(corners):
+        reason = "non_convex_projection"
+    elif scale <= 1e-3 or not np.isfinite(scale):
+        reason = "degenerate_scale"
     # The drone frame is rendered at working resolution against a tile of
     # comparable size, so an order-of-magnitude area change is implausible.
-    if not (0.04 <= res.scale_ratio <= 25.0):
-        return False, "implausible_scale_ratio"
-    if shear > 0.7:
-        return False, "excessive_shear"
+    elif not (0.04 <= res.scale_ratio <= 25.0):
+        reason = "implausible_scale_ratio"
+    elif shear > 0.7:
+        reason = "excessive_shear"
+    else:
+        # Aspect distortion: opposite edges of a planar view stay comparable.
+        e = [np.linalg.norm(corners[(i + 1) % 4] - corners[i]) for i in range(4)]
+        if min(e) < 1e-6:
+            reason = "degenerate_edges"
+        elif max(e[0], e[2]) / max(min(e[0], e[2]), 1e-6) > 4.0:
+            reason = "extreme_perspective"
+        elif max(e[1], e[3]) / max(min(e[1], e[3]), 1e-6) > 4.0:
+            reason = "extreme_perspective"
 
-    # Aspect distortion: opposite edges of a planar view stay comparable.
-    e = [np.linalg.norm(corners[(i + 1) % 4] - corners[i]) for i in range(4)]
-    if min(e) < 1e-6:
-        return False, "degenerate_edges"
-    if max(e[0], e[2]) / max(min(e[0], e[2]), 1e-6) > 4.0:
-        return False, "extreme_perspective"
-    if max(e[1], e[3]) / max(min(e[1], e[3]), 1e-6) > 4.0:
-        return False, "extreme_perspective"
+    if reason is not None:
+        return False, reason, False
 
     if res.inliers < settings.min_inliers:
-        return False, "below_min_inliers"
+        return False, "below_min_inliers", True
     if res.inlier_ratio < settings.min_inlier_ratio:
-        return False, "below_min_inlier_ratio"
+        return False, "below_min_inlier_ratio", True
     if res.reprojection_error > settings.max_reprojection_error:
-        return False, "reprojection_error_too_high"
+        return False, "reprojection_error_too_high", True
     if res.spatial_coverage < settings.min_spatial_coverage:
-        return False, "features_too_concentrated"
-    return True, None
+        return False, "features_too_concentrated", True
+    return True, None, False
 
 
 def scale_homography(H: np.ndarray, query_scale: float, target_scale: float) -> np.ndarray:

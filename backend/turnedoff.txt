@@ -1,0 +1,103 @@
+TURNED-OFF GEOMETRIC GATES
+==========================
+
+This file tracks pipeline checks that have been deliberately disabled, why,
+which file they live in, and how to turn them back on.
+
+
+1. NON-CONVEX QUADRILATERAL REJECTION  ("non_convex_projection")
+--------------------------------------------------------------------
+Status : DISABLED
+Date   : 2026-08-31
+
+What it did
+    After RANSAC fits a homography, the drone frame's four corners are
+    projected onto the reference map. If that projected quadrilateral is
+    self-intersecting / non-convex (a physically impossible camera view),
+    the candidate was rejected with reason "non_convex_projection".
+
+Why it was turned off
+    It is correct for RGB-photo -> RGB-map matching, but too strict for the
+    cross-domain case (real RGB drone photo -> rendered Google-style
+    roadmap tile). There LightGlue only finds a handful of correct matches,
+    RANSAC locks onto a slightly warped transform, and the true tile gets
+    thrown out even when it is the top retrieval candidate.
+
+Where it lives
+    Check         : backend/app/localization/homography.py
+                    function _plausibility(), the block:
+                        if settings.convexity_gate_enabled and not is_convex(corners):
+                            return False, "non_convex_projection"
+    Toggle flag   : backend/app/config.py
+                    Settings.convexity_gate_enabled  (default: True)
+    Current override: backend/.env
+                    CONVEXITY_GATE_ENABLED=false
+
+HOW TO TURN IT BACK ON
+    Option A (recommended): edit backend/.env and set
+        CONVEXITY_GATE_ENABLED=true
+    then restart the backend.
+
+    Option B: delete the CONVEXITY_GATE_ENABLED line from backend/.env
+    entirely. The code default in config.py is True, so the gate returns.
+
+    No code change is required either way. The is_convex() helper and the
+    _plausibility() branch are still in place; only the flag gates them.
+
+Note
+    All other geometric gates remain active: non_finite_projection,
+    degenerate_scale, implausible_scale_ratio, excessive_shear,
+    extreme_perspective, below_min_inliers, below_min_inlier_ratio,
+    reprojection_error_too_high, features_too_concentrated.
+
+
+2. PARTIAL-VERDICT REPORTING FOR WEAK MATCHES
+--------------------------------------------------------------------
+Status : ENABLED (behaviour change, not a disabled gate)
+Date   : 2026-08-31
+
+What changed
+    Geometric gates are now split in two:
+      - STRUCTURAL gates (non_finite_projection, non_convex_projection,
+        degenerate_scale, implausible_scale_ratio, excessive_shear,
+        degenerate_edges, extreme_perspective) -> hard "rejected".
+      - STRENGTH thresholds (below_min_inliers, below_min_inlier_ratio,
+        reprojection_error_too_high, features_too_concentrated) ->
+        "partial": the frame projects onto a plausible location, there is
+        just not enough evidence to accept it as a fix.
+
+    A partial candidate is shown as PARTIAL (amber) with its reason in the
+    UI candidate list, and decide() phrases the NO_MATCH explanation as a
+    partial match on that tile.
+
+    IMPORTANT: partial is NOT a match. Overall status stays NO_MATCH, no
+    confidence or coordinates are reported. It is a diagnostic label only.
+
+Where it lives
+    backend/app/localization/homography.py  -> _SOFT_GATES, _plausibility()
+    backend/app/localization/confidence.py  -> CandidateScore.partial,
+                                               ClusterScore.partial,
+                                               score_clusters() representative,
+                                               decide()
+    backend/app/localization/pipeline.py    -> best_cluster fallback,
+                                               feature_metrics.verdict/partial
+    frontend/src/components/Badge.jsx        -> VerdictBadge
+    frontend/src/pages/Processing.jsx        -> candidate list, stages 07 & 08
+
+Which tile the UI shows
+    When no cluster verifies, best_cluster now falls back to the best
+    PARTIAL cluster (was: the top-scored failed cluster), and that
+    cluster's representative is a partial member. So "Feature Matching"
+    (stage 07) and the result map show the actual near-miss tile - the
+    one ranked #1 in Candidate Map Search - instead of an arbitrary
+    rejected tile. To restore the old behaviour, drop the
+    `or next((c for c in cluster_scores if c.partial), None)` line in
+    pipeline.py and the partial branch in score_clusters()'s `pool`.
+
+HOW TO REVERT TO PLAIN REJECTED/VERIFIED
+    In homography.py _plausibility(), change the four
+        return False, "<reason>", True
+    lines back to
+        return False, "<reason>", False
+    (or set the third tuple element from a constant). partial then never
+    becomes true and every failure reads as "rejected" again.

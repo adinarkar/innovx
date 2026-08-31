@@ -152,6 +152,7 @@ class CandidateScore:
     spatial_coverage: float = 0.0
     reprojection_error: Optional[float] = None
     homography_valid: bool = False
+    partial: bool = False        # cleared every structural gate, missed only a strength threshold
     rejection: Optional[str] = None
     rotation_applied: int = 0
     shear: float = 0.0
@@ -172,6 +173,9 @@ class CandidateScore:
             "reprojection_error": (round(float(self.reprojection_error), 3)
                                    if self.reprojection_error is not None else None),
             "homography_valid": bool(self.homography_valid),
+            "verdict": ("verified" if self.homography_valid
+                        else "partial" if self.partial else "rejected"),
+            "partial": bool(self.partial),
             "rejection": self.rejection,
             "rotation_applied": int(self.rotation_applied),
             "geometric_score": round(float(self.geometric_score), 4),
@@ -204,7 +208,8 @@ def evaluate_candidate(candidate_id: int, tile_id: int, similarity: float,
         candidate_id=candidate_id, tile_id=tile_id, dino_similarity=float(similarity),
         raw_matches=hom.raw_matches, inliers=hom.inliers, inlier_ratio=hom.inlier_ratio,
         spatial_coverage=hom.spatial_coverage, reprojection_error=err,
-        homography_valid=valid, rejection=hom.rejection,
+        homography_valid=valid, partial=bool(hom.partial and not valid),
+        rejection=hom.rejection,
         rotation_applied=rotation_applied, shear=float(hom.shear), components=comp,
         geometric_score=_clamp01(geo),
     )
@@ -290,6 +295,7 @@ class ClusterScore:
     spatial_coverage: float = 0.0         # best observed among supporting tiles
     reprojection_error: Optional[float] = None   # inlier-weighted average
     homography_valid: bool = False
+    partial: bool = False                 # a member cleared every structural gate, just too weak
     rejection: Optional[str] = None
     rank: int = 0
     components: Dict[str, float] = field(default_factory=dict)
@@ -312,6 +318,9 @@ class ClusterScore:
             "reprojection_error": (round(float(self.reprojection_error), 3)
                                    if self.reprojection_error is not None else None),
             "homography_valid": bool(self.homography_valid),
+            "verdict": ("verified" if self.homography_valid
+                        else "partial" if self.partial else "rejected"),
+            "partial": bool(self.partial),
             "rejection": self.rejection,
             "geometric_score": round(float(self.geometric_score), 4),
             "final_score": round(float(self.final_score), 4),
@@ -377,7 +386,11 @@ def score_clusters(clusters: List[List[CandidateScore]]) -> List[ClusterScore]:
     raw: List[ClusterScore] = []
     for idx, members in enumerate(clusters):
         valid = [m for m in members if m.homography_valid]
-        representative = max(valid or members, key=lambda m: m.final_score or m.geometric_score)
+        # Representative: a verified member if any, else a partial member
+        # (near-miss), else the strongest of whatever is left. This is the
+        # tile the UI shows for the cluster.
+        pool = valid or [m for m in members if m.partial] or members
+        representative = max(pool, key=lambda m: m.final_score or m.geometric_score)
         support = len(valid)
 
         if valid:
@@ -390,12 +403,19 @@ def score_clusters(clusters: List[List[CandidateScore]]) -> List[ClusterScore]:
             total_w = sum(w for _, w in weighted)
             reprojection_error = (sum(e * w for e, w in weighted) / total_w
                                   if total_w > 0 else None)
-            homography_valid, rejection = True, None
+            homography_valid, rejection, partial = True, None, False
         else:
             raw_matches = max((m.raw_matches for m in members), default=0)
             inliers, inlier_ratio, reprojection_error = 0, 0.0, None
             spatial_coverage = max((m.spatial_coverage for m in members), default=0.0)
             homography_valid, rejection = False, representative.rejection
+            # Prefer a partial member's reason: it cleared every structural
+            # gate and only missed a strength threshold - the most informative
+            # thing we can say about a location we could not accept.
+            partial_member = next((m for m in members if m.partial), None)
+            partial = partial_member is not None
+            if partial_member is not None:
+                rejection = partial_member.rejection
 
         dino_similarity = max(m.dino_similarity for m in members)
         comp = {
@@ -418,7 +438,8 @@ def score_clusters(clusters: List[List[CandidateScore]]) -> List[ClusterScore]:
             dino_similarity=dino_similarity, raw_matches=raw_matches, inliers=inliers,
             inlier_ratio=inlier_ratio, spatial_coverage=spatial_coverage,
             reprojection_error=reprojection_error, homography_valid=homography_valid,
-            rejection=rejection, components=comp, geometric_score=_clamp01(geo),
+            partial=partial, rejection=rejection, components=comp,
+            geometric_score=_clamp01(geo),
         ))
 
     # Clusters are already spatially distinct by construction, so the
@@ -714,6 +735,12 @@ def decide(scores: List[ClusterScore]) -> tuple[MatchStatus, str]:
 
     if not valid:
         reason = best.rejection or "no_valid_homography"
+        partial = next((c for c in scores if c.partial), None)
+        if partial is not None:
+            return (MatchStatus.NO_MATCH,
+                    f"Partial match on candidate tile {partial.tile_id}: the drone frame "
+                    f"projects onto a plausible location but the evidence is too weak to "
+                    f"accept ({partial.rejection}). Not reported as a fix.")
         return (MatchStatus.NO_MATCH,
                 f"No candidate passed geometric verification (best rejection: {reason}). "
                 "The drone frame does not appear to overlap this reference map.")
