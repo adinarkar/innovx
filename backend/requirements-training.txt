@@ -1,0 +1,10 @@
+# Offline training for the Sat2Map translator (spec Phase 10).
+# NOT needed to run the localization server. Install after requirements.txt:
+#   pip install -r requirements-training.txt
+#
+# Pick the torch build for your machine (see requirements-ai.txt):
+#   CPU  : pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+#   CUDA : pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+torch>=2.2
+torchvision>=0.17
+tqdm>=4.66

@@ -24,6 +24,8 @@ import numpy as np
 from app.config import settings
 from app.logging_config import get_logger
 from app.localization import dino, homography as hg, visualization as viz
+from app.localization import semantic
+from app.localization.domain_translation import get_translation_engine
 from app.localization.imaging import fit_long_edge, imread
 from app.localization.confidence import (CandidateScore, ClusterScore, MatchStatus,
                                          cluster_candidates, decide, evaluate_candidate,
@@ -193,6 +195,69 @@ def _best_rotation(work_img: np.ndarray, query_feats: FeatureSet, tile_img: np.n
 
 
 # --------------------------------------------------------------------------
+# Cross-domain representations (spec Phases 3-4)
+# --------------------------------------------------------------------------
+def _build_representations(pre: PreprocessResult, stage: Callable
+                           ) -> Tuple[Dict[str, np.ndarray], Dict[str, dict], dict]:
+    """
+    Build the auxiliary representations of the drone frame.
+
+    ``"rgb"`` (the existing ``pre.matching_input``) is always present and is
+    the only representation the primary geometric branch depends on. The
+    optional ``"structural"`` and ``"map"`` branches are each wrapped so a
+    failure is logged and reported as ``skipped`` - never fatal, exactly as
+    the spec's failure-safety section requires.
+    """
+    representations: Dict[str, np.ndarray] = {"rgb": pre.matching_input}
+    meta: Dict[str, dict] = {"rgb": {"state": "ready", "backend": "clahe"}}
+    stats: dict = {}
+
+    # --- structural branch ---
+    if settings.structural_matching_enabled:
+        t0 = time.time()
+        try:
+            struct = semantic.build_structural_representation(pre.corrected)
+            representations["structural"] = struct.structural
+            representations["_structural_obj"] = struct  # renders only, popped later
+            stats.update(struct.stats())
+            meta["structural"] = {"state": "ready", "backend": struct.backend,
+                                  "seconds": round(time.time() - t0, 3)}
+            log.info("Structural representation built in %.3fs (%s).",
+                     time.time() - t0, struct.backend)
+        except Exception as exc:
+            meta["structural"] = {"state": "skipped", "error": str(exc)}
+            log.warning("Structural representation failed (%s) - skipping branch.", exc)
+        stage("structure", "Building structural representation...",
+              meta["structural"]["state"] if "structural" in meta else "skipped",
+              meta.get("structural", {}).get("error"))
+    else:
+        meta["structural"] = {"state": "skipped", "error": "disabled"}
+        stage("structure", "Building structural representation...", "skipped",
+              "STRUCTURAL_MATCHING_ENABLED is false")
+
+    # --- translated-map branch ---
+    engine = get_translation_engine()
+    if engine.available:
+        t0 = time.time()
+        try:
+            translated = engine.translate(pre.corrected)
+            representations["map"] = translated
+            meta["map"] = {"state": "ready", "backend": "sat2map-unet",
+                           "seconds": round(time.time() - t0, 3)}
+        except Exception as exc:
+            meta["map"] = {"state": "skipped", "error": str(exc)}
+            log.warning("Sat2Map translation failed (%s) - skipping branch.", exc)
+        stage("translate", "Generating map-style representation...",
+              meta["map"]["state"], meta.get("map", {}).get("error"))
+    else:
+        meta["map"] = {"state": "skipped", "error": engine.status}
+        stage("translate", "Generating map-style representation...", "skipped",
+              "Map translation model not installed")
+
+    return representations, meta, stats
+
+
+# --------------------------------------------------------------------------
 def localize(record: MapRecord, drone_path: Path, job_dir: Path,
              calibration: Optional[CameraCalibration] = None,
              progress: Optional[ProgressFn] = None,
@@ -235,6 +300,12 @@ def localize(record: MapRecord, drone_path: Path, job_dir: Path,
     timings["preprocess"] = time.time() - t0
     stage("preprocess", STAGES[1][1], "done",
           f"{dw}x{dh} -> {work_w}x{work_h} working resolution")
+
+    # ---- 2b. auxiliary cross-domain representations --------------------
+    t0 = time.time()
+    representations, rep_meta, rep_stats = _build_representations(pre, stage)
+    structural_obj = representations.pop("_structural_obj", None)
+    timings["representations"] = time.time() - t0
 
     # ---- 3. query embedding ---------------------------------------------
     stage(*STAGES[2])
@@ -340,11 +411,24 @@ def localize(record: MapRecord, drone_path: Path, job_dir: Path,
 
     renders = _render_all(job_dir, record, map_img, drone_img, pre, work_img,
                           query_feats, evaluations, best, accepted,
-                          agg_polygon, agg_center)
+                          agg_polygon, agg_center, structural_obj, representations)
     result = _build_result(record, status, explanation, best, best_cluster, diagnostic_scores,
                            evaluations, renders, drone_img, pre, query_feats,
                            map_w, map_h, timings, t_start, engine,
                            agg_center, agg_polygon, cluster_scores)
+    result["representations"] = {
+        "available": [k for k in representations if k in ("rgb", "structural", "map")],
+        "branches": rep_meta,
+        "renders": {
+            "original": renders.get("original"),
+            "preprocessed": renders.get("keypoints") or renders.get("enhanced"),
+            "structural": renders.get("structural_query"),
+            "translated_map": renders.get("translated_map"),
+            "matches": renders.get("matches_inliers"),
+            "final_overlay": renders.get("result_map"),
+        },
+    }
+    result["preprocessing"] = result["preprocessing"] | rep_stats
     timings["position"] = time.time() - t0
     stage("position", STAGES[7][1], "done", status_message(status))
     result["timings"] = {k: round(v, 3) for k, v in timings.items()}
@@ -450,7 +534,9 @@ def _render_all(job_dir: Path, record: MapRecord, map_img: np.ndarray,
                 query_feats: FeatureSet, evaluations: List[CandidateEvaluation],
                 best: Optional[CandidateEvaluation], accepted: bool,
                 agg_polygon: Optional[np.ndarray] = None,
-                agg_center: Optional[np.ndarray] = None) -> Dict[str, str]:
+                agg_center: Optional[np.ndarray] = None,
+                structural_obj=None,
+                representations: Optional[Dict[str, np.ndarray]] = None) -> Dict[str, str]:
     """Write every processing-stage image for this job (spec section 43)."""
     images: Dict[str, np.ndarray] = {
         "original": drone_img,
@@ -462,6 +548,12 @@ def _render_all(job_dir: Path, record: MapRecord, map_img: np.ndarray,
         "contours": pre.contours,
         "keypoints": viz.draw_keypoints(work_img, query_feats.keypoints, query_feats.scores),
     }
+    if structural_obj is not None:
+        images["structural_query"] = structural_obj.structural
+        if structural_obj.debug_overlay is not None:
+            images["structural_query_overlay"] = structural_obj.debug_overlay
+    if representations and "map" in representations:
+        images["translated_map"] = representations["map"]
 
     for ev in evaluations:
         if ev.tile_image is not None and ev.source == "tile":

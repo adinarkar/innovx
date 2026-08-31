@@ -74,6 +74,27 @@ class Settings(BaseSettings):
     low_confidence: float = 0.40
     ambiguity_gap: float = 0.06
 
+    # --- cross-domain map representation (spec: auxiliary branch) ---
+    # Every flag here is additive and optional. With all of them off the
+    # pipeline behaves exactly as before: RGB retrieval, SuperPoint+LightGlue,
+    # RANSAC, geometric verification, confidence.
+    structural_matching_enabled: bool = True     # build the structural query view
+    sat2map_enabled: bool = False                # load the Sat2Map translator
+    sat2map_model_path: Path = BACKEND_ROOT / "weights" / "sat2map_best.pt"
+    sat2map_device: str = "auto"                 # auto | cuda | cpu | mps
+    map_domain_retrieval_enabled: bool = False   # union translated-map candidates
+    map_domain_top_k: int = 10                   # shortlist size for the map branch
+    # How far (reference-map pixels) two representation estimates may sit apart
+    # and still be treated as agreeing. 0 => derive from the projected frame.
+    representation_consensus_px: float = 0.0
+    # Initial, deliberately non-authoritative fusion weights. Normalised at use.
+    rgb_weight: float = 0.40
+    structural_weight: float = 0.25
+    sat2map_weight: float = 0.15
+    retrieval_weight: float = 0.20
+    # Optional reference-map type hint: satellite | roadmap | terrain | unknown.
+    reference_map_type: str = "unknown"
+
     # --- search strategy ---
     rotation_search: bool = True
     # Evaluate all four orientations for every shortlisted candidate and keep

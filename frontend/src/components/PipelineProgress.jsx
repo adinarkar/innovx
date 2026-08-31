@@ -9,6 +9,8 @@ import { Chip } from './Badge'
 const PIPELINE = [
   ['prepare', 'Preparing reference map'],
   ['preprocess', 'Processing drone frame'],
+  ['structure', 'Building structural representation'],
+  ['translate', 'Generating map-style representation'],
   ['embed', 'Computing AI embeddings'],
   ['retrieve', 'Searching map for candidates'],
   ['features', 'Extracting local features'],
@@ -20,7 +22,7 @@ const PIPELINE = [
 export default function PipelineProgress({ job, busy }) {
   const stages = job?.stages || []
   const byKey = Object.fromEntries(stages.map((s) => [s.key, s]))
-  const doneCount = stages.filter((s) => s.state === 'done').length
+  const doneCount = stages.filter((s) => s.state === 'done' || s.state === 'skipped').length
   const pct = (doneCount / PIPELINE.length) * 100
 
   return (
@@ -48,6 +50,7 @@ export default function PipelineProgress({ job, busy }) {
         {PIPELINE.map(([key, label], index) => {
           const stage = byKey[key]
           const state = stage?.state || 'pending'
+          const isSkipped = state === 'skipped'
           const isDone = state === 'done'
           const isRunning = state === 'running'
           const isError = state === 'error'
@@ -72,7 +75,7 @@ export default function PipelineProgress({ job, busy }) {
                         : 'bg-ink-line text-ink-muted',
                 ].join(' ')}
               >
-                {isDone ? '✓' : isError ? '!' : index + 1}
+                {isDone ? '✓' : isError ? '!' : isSkipped ? '–' : index + 1}
               </span>
 
               <div className="min-w-0 flex-1">

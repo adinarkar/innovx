@@ -20,6 +20,16 @@ frontend/dist/
 # Generated test data
 test_data/generated/
 
+# Training datasets and model weights (never commit large binaries)
+backend/datasets/
+backend/raw/
+backend/weights/*
+!backend/weights/.gitkeep
+*.pt
+*.pth
+*.ts
+*.onnx
+
 # Environment
 .env
 .env.local

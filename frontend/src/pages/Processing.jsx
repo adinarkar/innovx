@@ -15,6 +15,7 @@ const STAGES = [
   { key: 'corrected', label: 'Corrected' },
   { key: 'enhanced', label: 'Enhanced' },
   { key: 'structural', label: 'Structural' },
+  { key: 'aimap', label: 'AI Map View' },
   { key: 'features', label: 'Features' },
   { key: 'candidate', label: 'Candidate' },
   { key: 'matches', label: 'Matches' },
@@ -66,6 +67,7 @@ export default function Processing() {
         {active === 'corrected' && <StageCorrected result={result} />}
         {active === 'enhanced' && <StageEnhanced result={result} />}
         {active === 'structural' && <StageStructural result={result} />}
+        {active === 'aimap' && <StageAiMap result={result} />}
         {active === 'features' && <StageFeatures result={result} />}
         {active === 'candidate' && <StageCandidates result={result} mapInfo={mapInfo} />}
         {active === 'matches' && <StageMatches result={result} />}
@@ -239,6 +241,57 @@ function StageStructural({ result }) {
           Edge density: {percent(result.preprocessing.edge_density, 2)}
         </p>
       </div>
+    </section>
+  )
+}
+
+function StageAiMap({ result }) {
+  const reps = result.representations || {}
+  const branches = reps.branches || {}
+  const struct = branches.structural || {}
+  const map = branches.map || {}
+  const structuralSrc = reps.renders?.structural || result.renders?.structural_query
+  const mapSrc = reps.renders?.translated_map || result.renders?.translated_map
+
+  return (
+    <section className="card card-pad">
+      <StageHeader
+        number="04b"
+        title="AI Map View"
+        description="Cross-domain representations of the drone frame used to match a real photograph against a road/terrain-style reference. These are auxiliary — they never override the RGB geometric result."
+        aside={<Chip tone="brand">AUXILIARY</Chip>}
+      />
+      <div className="grid gap-4 lg:grid-cols-2">
+        <div>
+          <h3 className="section-title">Structural representation</h3>
+          {struct.state === 'ready' && structuralSrc ? (
+            <ImageFrame src={fileUrl(structuralSrc)} alt="Structural representation"
+                        caption="Road-like structure and block outlines (OpenCV)." />
+          ) : (
+            <div className="grid h-56 place-items-center rounded-xl border border-dashed border-ink-line px-6 text-center text-[12.5px] text-ink-muted">
+              {struct.error === 'disabled'
+                ? 'Structural matching disabled (STRUCTURAL_MATCHING_ENABLED=false).'
+                : `Structural branch skipped${struct.error ? ` — ${struct.error}` : ''}.`}
+            </div>
+          )}
+        </div>
+        <div>
+          <h3 className="section-title">Generated map-style view</h3>
+          {map.state === 'ready' && mapSrc ? (
+            <ImageFrame src={fileUrl(mapSrc)} alt="Generated map-style representation"
+                        caption="Sat2Map translator output." />
+          ) : (
+            <div className="grid h-56 place-items-center rounded-xl border border-dashed border-ink-line px-6 text-center text-[12.5px] text-ink-muted">
+              Map translation model not installed
+            </div>
+          )}
+        </div>
+      </div>
+      <p className="mt-4 rounded-lg bg-brand-bg px-4 py-3 text-[12px] leading-relaxed text-ink-soft ring-1 ring-brand-light">
+        The Sat2Maps dataset contains satellite/road-map pairs, not real drone
+        imagery. A model pretrained only on Sat2Maps should be fine-tuned and
+        evaluated using real drone imagery before deployment.
+      </p>
     </section>
   )
 }

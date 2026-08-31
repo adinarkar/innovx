@@ -126,7 +126,9 @@ Deliberately out of scope for this stage:
 - autonomous drone navigation or flight-controller integration
 - SLAM, visual odometry or optical flow
 - GPS/IMU sensor fusion
-- training a custom neural network (only pretrained models are used)
+- the core localization path stays classical + pretrained (DINOv2, SuperPoint,
+  LightGlue). The optional Sat2Map translator is the one trainable component,
+  and it is an auxiliary representation only — never required for a fix
 
 ---
 
@@ -236,7 +238,16 @@ every crop.
 
 ## Testing strategy
 
-Run the offline harness from the `backend` directory:
+Unit tests (dataset splitting, paired-image correctness, structural
+representation, translation module with a missing checkpoint and with a mock
+model, multi-representation build, failure-safety, no-regression):
+
+```bash
+cd backend
+pytest -q
+```
+
+Run the offline accuracy harness:
 
 ```bash
 cd backend
@@ -395,6 +406,60 @@ the projected frame diagonal.
 
 ---
 
+## Cross-domain map representation (auxiliary)
+
+The reference image is not always a photograph — it may be a road map, terrain
+map or map screenshot. A real RGB drone frame and a road map share little
+photometric texture but the same *structure*. VisualNav can build extra
+representations of the drone frame to help bridge that gap. **They are
+auxiliary**: the RGB geometric branch remains the sole safety-critical path,
+and a hallucinated road in a generated map can never by itself produce a fix.
+
+| Representation | How | Status |
+|---|---|---|
+| `rgb` | existing CLAHE-normalised frame (`pre.matching_input`) | always on |
+| `structural` | OpenCV road/edge/block extraction (`localization/semantic.py`) | on by default (`STRUCTURAL_MATCHING_ENABLED`) |
+| `map` | Sat2Map U-Net translator (`localization/domain_translation.py`) | off unless a checkpoint exists and `SAT2MAP_ENABLED=true` |
+
+If the Sat2Map model is unavailable the pipeline logs
+`Sat2Map translation unavailable - using standard localization pipeline.`,
+marks the `translate` stage `skipped`, and continues. Every optional branch is
+wrapped so a failure is logged and skipped, never fatal (no HTTP 500 because an
+auxiliary representation failed).
+
+The **AI Map View** tab on the Processing page shows the structural and
+generated-map representations, or `Map translation model not installed` when the
+translator is absent.
+
+### Sat2Maps training
+
+Training is fully separate from the server (`backend/training/sat2map/`, see its
+[README](backend/training/sat2map/README.md)): dataset preparation, a small
+U-Net (L1 + SSIM + edge loss — not a GAN), evaluation with mapping-relevant
+metrics, and export. Nothing is downloaded at application startup and no dataset
+or checkpoint is committed to Git.
+
+```bash
+cd backend
+pip install -r requirements-training.txt        # torch + torchvision
+python -m training.sat2map.prepare_dataset --src ./raw/sat2maps --out ./datasets/sat2maps
+python -m training.sat2map.train --dataset ./datasets/sat2maps --epochs 50 --batch-size 8 --output ./weights/sat2map
+python -m training.sat2map.export --checkpoint ./weights/sat2map/sat2map_best.pt --out ./weights/sat2map_best.pt
+```
+
+Then set `SAT2MAP_ENABLED=true` and `SAT2MAP_MODEL_PATH=weights/sat2map_best.pt`.
+
+> **The Sat2Maps dataset contains satellite/road-map pairs, not real drone
+> imagery. A model pretrained only on Sat2Maps should be fine-tuned and
+> evaluated using real drone imagery before deployment.** The training code
+> reuses the same loop for a future `drone camera → map` fine-tune
+> (`--aerial-dir aerial --resume <sat2maps ckpt>`).
+
+To disable map translation entirely: leave `SAT2MAP_ENABLED=false` (the
+default). To disable the structural branch too: `STRUCTURAL_MATCHING_ENABLED=false`.
+
+---
+
 ## Georeferencing and GPS
 
 GPS coordinates are never invented. `gps` is `null` until the operator supplies
@@ -517,6 +582,15 @@ All settings are environment variables with defaults — see `.env.example`.
 | `ROTATION_SEARCH` | `true` | Enable the rotation search at all |
 | `ROTATION_SEARCH_ALWAYS` | `true` | Evaluate all 4 orientations per candidate and keep the best, instead of only rotating when upright fails |
 | `GLOBAL_FALLBACK` | `true` | Whole-map attempt when all tiles fail |
+| `STRUCTURAL_MATCHING_ENABLED` | `true` | Build the OpenCV structural representation of the drone frame |
+| `SAT2MAP_ENABLED` | `false` | Load the Sat2Map aerial→map translator |
+| `SAT2MAP_MODEL_PATH` | `weights/sat2map_best.pt` | Translator checkpoint (relative to `backend/`) |
+| `SAT2MAP_DEVICE` | `auto` | `auto` / `cuda` / `cpu` / `mps` |
+| `MAP_DOMAIN_RETRIEVAL_ENABLED` | `false` | Union translated-map DINO candidates with the RGB shortlist |
+| `MAP_DOMAIN_TOP_K` | `10` | Shortlist size for the map-domain retrieval branch |
+| `REPRESENTATION_CONSENSUS_PX` | `0` | Agreement tolerance in map px (`0` = derive from frame footprint) |
+| `RGB_WEIGHT` / `STRUCTURAL_WEIGHT` / `SAT2MAP_WEIGHT` / `RETRIEVAL_WEIGHT` | `0.40 / 0.25 / 0.15 / 0.20` | Initial, configurable fusion weights (normalised at use) |
+| `REFERENCE_MAP_TYPE` | `unknown` | `satellite` / `roadmap` / `terrain` / `unknown` hint |
 
 > **Tuned for accuracy over speed.** The defaults above trade processing time
 > for higher-confidence, better-verified matches: a larger keypoint budget and
@@ -557,6 +631,9 @@ innovx-visualnav/
 │   │   ├── localization/
 │   │   │   ├── imaging.py         I/O and resize helpers
 │   │   │   ├── preprocessing.py   both branches + Structural Terrain View
+│   │   │   ├── semantic.py        auxiliary structural representation (OpenCV)
+│   │   │   ├── domain_translation.py  optional Sat2Map aerial→map translator
+│   │   │   ├── _sat2map_net.py    U-Net architecture shared with training
 │   │   │   ├── tiling.py          multi-scale overlapping windows
 │   │   │   ├── dino.py            global descriptors + retrieval
 │   │   │   ├── superpoint.py      local feature extraction
@@ -570,8 +647,11 @@ innovx-visualnav/
 │   │   ├── plan/qgc_parser.py
 │   │   └── models/loader.py       lazy model loading, device selection
 │   ├── scripts/evaluate.py        offline accuracy harness
+│   ├── training/sat2map/          Sat2Map dataset prep + U-Net training (offline)
+│   ├── tests/                     pytest suite
+│   ├── weights/                   model checkpoints (git-ignored)
 │   ├── cache/  uploads/  processed/
-│   └── requirements.txt · requirements-ai.txt
+│   └── requirements.txt · requirements-ai.txt · requirements-training.txt
 │
 ├── test_data/generate_test_data.py
 ├── docker-compose.yml

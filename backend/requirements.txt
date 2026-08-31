@@ -10,6 +10,9 @@ numpy>=1.26
 opencv-contrib-python>=4.9
 Pillow>=10.2
 
+# --- Tests ---
+pytest>=8.0
+
 # --- Optional AI stack -------------------------------------------------
 # The pipeline runs without these (classical retrieval + SIFT fallback),
 # but DINOv2 / SuperPoint / LightGlue are only active when installed.
