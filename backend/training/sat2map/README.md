@@ -93,6 +93,20 @@ python -m training.sat2map.evaluate \
     --out ./weights/sat2map/eval
 ```
 
+### Training report (optional)
+
+`report.py` bakes `history.json`, `config.json`, the run's preview PNGs and the
+`eval/` triptychs into one self-contained `report.html` (loss curves + tables +
+images, no server, opens from `file://`):
+
+```bash
+python -m training.sat2map.report --run ./weights/sat2map
+# -> ./weights/sat2map/report.html
+```
+
+It is a training artefact, not part of the app, and is git-ignored with the
+rest of `weights/`.
+
 ## 4. Export & wire into inference
 
 ```bash
