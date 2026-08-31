@@ -14,7 +14,7 @@ result leaves this module.
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -124,6 +124,8 @@ class CandidateEvaluation:
     target_pts_work: Optional[np.ndarray] = None
     inlier_map_points: Optional[np.ndarray] = None   # inliers in map pixels
     source: str = "tile"                        # tile | global
+    retrieval_sources: List[str] = field(default_factory=lambda: ["rgb"])
+    retrieval_similarity_by_source: Dict[str, float] = field(default_factory=dict)
 
 
 def _prepare_work_image(img: np.ndarray) -> Tuple[np.ndarray, float]:
@@ -257,6 +259,67 @@ def _build_representations(pre: PreprocessResult, stage: Callable
     return representations, meta, stats
 
 
+# Which auxiliary representations may contribute their own retrieval shortlist
+# (spec Phase 5). RGB is always the primary; these are unioned in on top.
+_RETRIEVAL_AUX_ORDER = ("map", "structural")
+
+
+def _multi_domain_retrieval(engine, record: MapRecord, rgb_embedding: np.ndarray,
+                            representations: Dict[str, np.ndarray],
+                            primary_top_k: int) -> Tuple[List[dict], Dict[str, int]]:
+    """
+    Coarse candidate retrieval, optionally unioned across representations.
+
+    DINOv2 remains the *only* coarse search stage - LightGlue never runs over
+    every tile. The RGB representation always drives the primary shortlist; when
+    ``MAP_DOMAIN_RETRIEVAL_ENABLED`` is set, the generated map-like image (and
+    the structural image, if present) each contribute their own ``MAP_DOMAIN_TOP_K``
+    candidates. The lists are unioned by tile, de-duplicated, and capped at
+    ``CANDIDATE_UNION_MAX``. Each surviving hit records which representations
+    retrieved it and its best similarity, so downstream fusion can reward
+    cross-domain agreement.
+    """
+    primary = dino.top_k(rgb_embedding, record.embeddings, primary_top_k)
+    merged: Dict[int, dict] = {}
+    for rank, hit in enumerate(primary):
+        merged[hit["index"]] = {
+            "index": hit["index"], "similarity": hit["similarity"],
+            "sources": ["rgb"], "similarity_by_source": {"rgb": hit["similarity"]},
+            "_order": (0, rank),
+        }
+    per_source_counts = {"rgb": len(primary)}
+
+    if settings.map_domain_retrieval_enabled:
+        for si, name in enumerate(_RETRIEVAL_AUX_ORDER, start=1):
+            img = representations.get(name)
+            if img is None:
+                continue
+            try:
+                emb = engine.embed(img)
+                hits = dino.top_k(emb, record.embeddings, settings.map_domain_top_k)
+            except Exception as exc:  # failure-safe: aux retrieval never blocks
+                log.warning("%s-domain retrieval failed (%s) - skipping.", name, exc)
+                continue
+            per_source_counts[name] = len(hits)
+            for rank, hit in enumerate(hits):
+                entry = merged.get(hit["index"])
+                if entry is None:
+                    merged[hit["index"]] = {
+                        "index": hit["index"], "similarity": hit["similarity"],
+                        "sources": [name],
+                        "similarity_by_source": {name: hit["similarity"]},
+                        "_order": (si, rank),
+                    }
+                else:
+                    entry["sources"].append(name)
+                    entry["similarity_by_source"][name] = hit["similarity"]
+                    entry["similarity"] = max(entry["similarity"], hit["similarity"])
+
+    ordered = sorted(merged.values(), key=lambda e: e.pop("_order"))
+    ordered = ordered[:max(primary_top_k, settings.candidate_union_max)]
+    return ordered, per_source_counts
+
+
 # --------------------------------------------------------------------------
 def localize(record: MapRecord, drone_path: Path, job_dir: Path,
              calibration: Optional[CameraCalibration] = None,
@@ -315,12 +378,18 @@ def localize(record: MapRecord, drone_path: Path, job_dir: Path,
     timings["embed"] = time.time() - t0
     stage("embed", STAGES[2][1], "done", f"backend: {engine.backend}")
 
-    # ---- 4. retrieval ----------------------------------------------------
+    # ---- 4. retrieval (optionally multi-domain) ------------------------
     stage(*STAGES[3])
     t0 = time.time()
-    retrieved = dino.top_k(query_embedding, record.embeddings, top_k)
+    retrieved, retrieval_counts = _multi_domain_retrieval(
+        engine, record, query_embedding, representations, top_k)
     timings["retrieve"] = time.time() - t0
-    stage("retrieve", STAGES[3][1], "done", f"top {len(retrieved)} of {len(record.tiles)} tiles")
+    if len(retrieval_counts) > 1:
+        detail = (f"{len(retrieved)} unioned of {len(record.tiles)} tiles ("
+                  + ", ".join(f"{k}:{v}" for k, v in retrieval_counts.items()) + ")")
+    else:
+        detail = f"top {len(retrieved)} of {len(record.tiles)} tiles"
+    stage("retrieve", STAGES[3][1], "done", detail)
 
     # ---- 5. query features ----------------------------------------------
     stage(*STAGES[4])
@@ -349,7 +418,10 @@ def localize(record: MapRecord, drone_path: Path, job_dir: Path,
         ev = CandidateEvaluation(cand_idx + 1, tile, hit["similarity"], score, hom,
                                  match, rotation_used, tile_image=tile_img,
                                  query_pts_work=match.query_pts,
-                                 target_pts_work=match.target_pts)
+                                 target_pts_work=match.target_pts,
+                                 retrieval_sources=list(hit.get("sources", ["rgb"])),
+                                 retrieval_similarity_by_source=dict(
+                                     hit.get("similarity_by_source", {})))
 
         if hom.ok and hom.H is not None:
             # working-drone -> working-tile  =>  original-drone -> map pixels
@@ -456,7 +528,8 @@ def _global_fallback(map_img: np.ndarray, work_img: np.ndarray,
     ev = CandidateEvaluation(999, None, 0.0, score, hom, match, 0,
                              tile_image=map_small, source="global",
                              query_pts_work=match.query_pts,
-                             target_pts_work=match.target_pts)
+                             target_pts_work=match.target_pts,
+                             retrieval_sources=["global"])
     ev.H_map = hg.scale_homography(hom.H, work_scale, map_scale)
     ev.polygon = hg.transform_points(ev.H_map, hg.frame_corners(dw, dh))
     ev.center = hg.transform_points(ev.H_map, np.array([[dw / 2.0, dh / 2.0]]))[0]
@@ -644,6 +717,10 @@ def _build_result(record: MapRecord, status: MatchStatus, explanation: str,
             entry["tile"] = ev.tile.to_dict()
             entry["preview_url"] = renders.get(f"candidate_{s.candidate_id}")
         entry["source"] = ev.source if ev else "tile"
+        entry["retrieval_sources"] = list(ev.retrieval_sources) if ev else ["rgb"]
+        if ev is not None and ev.retrieval_similarity_by_source:
+            entry["retrieval_similarity_by_source"] = {
+                k: round(float(v), 4) for k, v in ev.retrieval_similarity_by_source.items()}
         if ev is not None and ev.polygon is not None:
             entry["polygon"] = hg.clamp_polygon(ev.polygon, map_w, map_h)
         cluster = cluster_by_candidate.get(s.candidate_id)
@@ -694,6 +771,14 @@ def _build_result(record: MapRecord, status: MatchStatus, explanation: str,
         "polygon_gps": polygon_gps,
         "georeferenced": record.georeference is not None,
         "candidates": candidates,
+        "retrieval": {
+            "candidate_count": len(evaluations),
+            "best_similarity": round(
+                max((float(e.similarity) for e in evaluations), default=0.0), 4),
+            "sources": sorted({s for e in evaluations for s in e.retrieval_sources}),
+            "multi_domain": len({s for e in evaluations
+                                 for s in e.retrieval_sources}) > 1,
+        },
         "location_clusters": [c.to_dict() for c in cluster_scores],
         "drone_image": {"width": dw, "height": dh,
                         "aspect_ratio": round(dw / dh, 4) if dh else 0.0},

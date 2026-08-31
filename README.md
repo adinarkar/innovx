@@ -431,6 +431,17 @@ The **AI Map View** tab on the Processing page shows the structural and
 generated-map representations, or `Map translation model not installed` when the
 translator is absent.
 
+### Multi-domain candidate retrieval
+
+DINOv2 remains the only coarse search stage — LightGlue never runs over every
+tile. With `MAP_DOMAIN_RETRIEVAL_ENABLED=true`, the map-like and structural
+representations each contribute their own `MAP_DOMAIN_TOP_K` DINO candidates,
+which are unioned with the RGB shortlist, de-duplicated by tile and capped at
+`CANDIDATE_UNION_MAX`. Every candidate records which representations retrieved
+it (`retrieval_sources` in the API, shown in the Candidates tab), and the
+`retrieval` block reports `candidate_count`, `best_similarity`, `sources` and
+`multi_domain`. Default off — the RGB shortlist alone is unchanged.
+
 ### Sat2Maps training
 
 Training is fully separate from the server (`backend/training/sat2map/`, see its
@@ -586,8 +597,9 @@ All settings are environment variables with defaults — see `.env.example`.
 | `SAT2MAP_ENABLED` | `false` | Load the Sat2Map aerial→map translator |
 | `SAT2MAP_MODEL_PATH` | `weights/sat2map_best.pt` | Translator checkpoint (relative to `backend/`) |
 | `SAT2MAP_DEVICE` | `auto` | `auto` / `cuda` / `cpu` / `mps` |
-| `MAP_DOMAIN_RETRIEVAL_ENABLED` | `false` | Union translated-map DINO candidates with the RGB shortlist |
-| `MAP_DOMAIN_TOP_K` | `10` | Shortlist size for the map-domain retrieval branch |
+| `MAP_DOMAIN_RETRIEVAL_ENABLED` | `false` | Also retrieve DINO candidates from the map/structural representations and union them with the RGB shortlist |
+| `MAP_DOMAIN_TOP_K` | `10` | Shortlist size for each auxiliary retrieval branch |
+| `CANDIDATE_UNION_MAX` | `18` | Cap on the de-duplicated unioned shortlist |
 | `REPRESENTATION_CONSENSUS_PX` | `0` | Agreement tolerance in map px (`0` = derive from frame footprint) |
 | `RGB_WEIGHT` / `STRUCTURAL_WEIGHT` / `SAT2MAP_WEIGHT` / `RETRIEVAL_WEIGHT` | `0.40 / 0.25 / 0.15 / 0.20` | Initial, configurable fusion weights (normalised at use) |
 | `REFERENCE_MAP_TYPE` | `unknown` | `satellite` / `roadmap` / `terrain` / `unknown` hint |

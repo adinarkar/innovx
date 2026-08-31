@@ -333,7 +333,11 @@ function StageCandidates({ result, mapInfo }) {
       <StageHeader
         number="06"
         title="Candidate Map Search"
-        description="Top candidate regions retrieved by global-descriptor similarity. Retrieval only shortlists — it never decides the final position."
+        description={
+          result.retrieval?.multi_domain
+            ? `Candidate regions retrieved by global-descriptor similarity and unioned across representations (${result.retrieval.sources.join(', ')}). Retrieval only shortlists — it never decides the final position.`
+            : 'Top candidate regions retrieved by global-descriptor similarity. Retrieval only shortlists — it never decides the final position.'
+        }
         aside={<Chip tone="neutral">{result.map_image.tiles} TILES SEARCHED</Chip>}
       />
 
@@ -370,6 +374,12 @@ function StageCandidates({ result, mapInfo }) {
                   Similarity: {percent(c.dino_similarity, 1)}
                   {c.tile && ` · at (${c.tile.x}, ${c.tile.y}) · ${c.tile.width}px`}
                 </div>
+                {c.retrieval_sources && c.retrieval_sources.length > 0 &&
+                  !(c.retrieval_sources.length === 1 && c.retrieval_sources[0] === 'rgb') && (
+                    <div className="mt-0.5 text-[10.5px] font-mono text-ink-muted">
+                      retrieved via: {c.retrieval_sources.join(' + ')}
+                    </div>
+                  )}
               </div>
               <BoolBadge value={c.homography_valid} />
             </button>

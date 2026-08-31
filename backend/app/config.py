@@ -84,6 +84,7 @@ class Settings(BaseSettings):
     sat2map_device: str = "auto"                 # auto | cuda | cpu | mps
     map_domain_retrieval_enabled: bool = False   # union translated-map candidates
     map_domain_top_k: int = 10                   # shortlist size for the map branch
+    candidate_union_max: int = 18                # cap on the unioned shortlist
     # How far (reference-map pixels) two representation estimates may sit apart
     # and still be treated as agreeing. 0 => derive from the projected frame.
     representation_consensus_px: float = 0.0
