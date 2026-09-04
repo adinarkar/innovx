@@ -76,19 +76,36 @@ def match_superpoint(query: FeatureSet, target: FeatureSet) -> Optional[MatchRes
     return MatchResult(q, t, conf, "superpoint+lightglue")
 
 
-def extract_features(img: np.ndarray, prefer: Optional[str] = None) -> FeatureSet:
+def extract_features(img: np.ndarray, prefer: Optional[str] = None,
+                     max_keypoints: Optional[int] = None,
+                     superpoint_detection_threshold: Optional[float] = None,
+                     superpoint_nms_radius: Optional[int] = None,
+                     sift_contrast_threshold: Optional[float] = None,
+                     sift_edge_threshold: Optional[float] = None) -> FeatureSet:
     """
     Extract local features with the configured backend.
 
     SuperPoint when available and requested; SIFT otherwise.  SuperPoint
     feature sets keep their native tensors so LightGlue can reuse them.
+
+    The keypoint-strength params all default from ``settings`` but accept an
+    explicit override. ``pipeline.localize`` resolves them once per request
+    and passes them through every call for that job, rather than letting
+    this function read ``settings`` fresh each time - the shared singleton
+    can be mutated mid-flight by a *different*, concurrently-running request
+    (e.g. one job using the Efficient Matching preset overlapping another
+    that isn't).
     """
     prefer = (prefer or settings.matcher).lower()
     if prefer != "sift":
-        fs = sp_backend.extract(img)
+        fs = sp_backend.extract(img, max_keypoints=max_keypoints,
+                                detection_threshold=superpoint_detection_threshold,
+                                nms_radius=superpoint_nms_radius)
         if fs is not None:
             return fs
-    return sift_backend.extract(img)
+    return sift_backend.extract(img, max_keypoints=max_keypoints,
+                                contrast_threshold=sift_contrast_threshold,
+                                edge_threshold=sift_edge_threshold)
 
 
 def match_features(query: FeatureSet, target: FeatureSet,

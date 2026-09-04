@@ -22,19 +22,39 @@ LOWE_RATIO = 0.78
 _FLANN_KDTREE = 1
 
 
-def _detector(max_keypoints: int):
-    return cv2.SIFT_create(nfeatures=max_keypoints)
+def _detector(max_keypoints: int, contrast_threshold: float, edge_threshold: float):
+    # contrastThreshold/edgeThreshold discard low-contrast and edge-like
+    # (less distinctive) features *before* OpenCV ranks and caps to
+    # nfeatures - raising/lowering them respectively is what makes the
+    # "efficient matching" preset keep fewer, stronger points.
+    return cv2.SIFT_create(nfeatures=max_keypoints,
+                           contrastThreshold=contrast_threshold,
+                           edgeThreshold=edge_threshold)
 
 
-def extract(img: np.ndarray, max_keypoints: Optional[int] = None) -> FeatureSet:
-    """Detect SIFT keypoints/descriptors on a BGR image."""
+def extract(img: np.ndarray, max_keypoints: Optional[int] = None,
+           contrast_threshold: Optional[float] = None,
+           edge_threshold: Optional[float] = None) -> FeatureSet:
+    """
+    Detect SIFT keypoints/descriptors on a BGR image.
+
+    All three thresholds default from ``settings`` but accept an explicit
+    override - callers processing one localisation request should always
+    resolve and pass these once up front (see ``pipeline.localize``) rather
+    than let this function re-read the shared ``settings`` singleton, which
+    a *different*, concurrently-running request could have changed in the
+    meantime.
+    """
     max_keypoints = max_keypoints or settings.max_keypoints
+    contrast_threshold = (settings.sift_contrast_threshold
+                          if contrast_threshold is None else contrast_threshold)
+    edge_threshold = settings.sift_edge_threshold if edge_threshold is None else edge_threshold
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
     # A light equalisation makes SIFT far more stable across exposure changes
     # between a satellite basemap and a drone frame.
     gray = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
 
-    kps, desc = _detector(max_keypoints).detectAndCompute(gray, None)
+    kps, desc = _detector(max_keypoints, contrast_threshold, edge_threshold).detectAndCompute(gray, None)
     h, w = gray.shape[:2]
     if not kps:
         return FeatureSet(keypoints=np.zeros((0, 2), np.float32), descriptors=None,

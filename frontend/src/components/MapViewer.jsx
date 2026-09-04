@@ -23,11 +23,21 @@ export default function MapViewer({
   onLayerChange,
   caption,
   viewportClass = 'h-[460px]',
+  // Region selection: when regionMode is true, pointer drag draws a
+  // map-pixel rectangle instead of panning. `region` renders the current
+  // selection (controlled); `onRegionChange` fires with {x,y,width,height}
+  // on release, or null if the drag was too small to count as a selection.
+  regionMode = false,
+  region = null,
+  onRegionChange,
 }) {
   const wrapRef = useRef(null)
+  const imgRef = useRef(null)
   const [zoom, setZoom] = useState(1)
   const [offset, setOffset] = useState({ x: 0, y: 0 })
   const dragRef = useRef(null)
+  const [drawRect, setDrawRect] = useState(null)
+  const drawStartRef = useRef(null)
 
   const reset = useCallback(() => {
     setZoom(1)
@@ -65,15 +75,61 @@ export default function MapViewer({
     return () => node.removeEventListener('wheel', onWheel)
   }, [onWheel])
 
+  // Screen point -> natural map-pixel point, read straight off the <img>'s
+  // own rendered box so it stays correct at any zoom/pan without inverting
+  // the CSS transform by hand.
+  const toNaturalPoint = useCallback((event) => {
+    const rect = imgRef.current?.getBoundingClientRect()
+    if (!rect || !width || !height) return null
+    const nx = ((event.clientX - rect.left) / rect.width) * width
+    const ny = ((event.clientY - rect.top) / rect.height) * height
+    return { x: Math.min(Math.max(nx, 0), width), y: Math.min(Math.max(ny, 0), height) }
+  }, [width, height])
+
   const onPointerDown = (event) => {
+    if (regionMode) {
+      const pt = toNaturalPoint(event)
+      if (!pt) return
+      drawStartRef.current = pt
+      setDrawRect({ x: pt.x, y: pt.y, width: 0, height: 0 })
+      event.currentTarget.setPointerCapture(event.pointerId)
+      return
+    }
     dragRef.current = { x: event.clientX - offset.x, y: event.clientY - offset.y }
     event.currentTarget.setPointerCapture(event.pointerId)
   }
   const onPointerMove = (event) => {
+    if (regionMode) {
+      if (!drawStartRef.current) return
+      const pt = toNaturalPoint(event)
+      if (!pt) return
+      const start = drawStartRef.current
+      setDrawRect({
+        x: Math.min(start.x, pt.x), y: Math.min(start.y, pt.y),
+        width: Math.abs(pt.x - start.x), height: Math.abs(pt.y - start.y),
+      })
+      return
+    }
     if (!dragRef.current) return
     setOffset({ x: event.clientX - dragRef.current.x, y: event.clientY - dragRef.current.y })
   }
   const onPointerUp = (event) => {
+    if (regionMode) {
+      drawStartRef.current = null
+      event.currentTarget.releasePointerCapture?.(event.pointerId)
+      // Require a non-trivial drag (~1% of the shorter side) so a stray
+      // click doesn't register as a zero-area region.
+      const minSize = Math.min(width, height) * 0.01
+      setDrawRect((rect) => {
+        if (rect && rect.width > minSize && rect.height > minSize) {
+          onRegionChange?.(rect)
+        } else {
+          onRegionChange?.(null)
+        }
+        return null
+      })
+      return
+    }
     dragRef.current = null
     event.currentTarget.releasePointerCapture?.(event.pointerId)
   }
@@ -122,7 +178,9 @@ export default function MapViewer({
 
       <div
         ref={wrapRef}
-        className={`relative ${viewportClass} cursor-grab overflow-hidden bg-brand-bg/50 active:cursor-grabbing`}
+        className={`relative ${viewportClass} overflow-hidden bg-brand-bg/50 ${
+          regionMode ? 'cursor-crosshair' : 'cursor-grab active:cursor-grabbing'
+        }`}
         onPointerDown={onPointerDown}
         onPointerMove={onPointerMove}
         onPointerUp={onPointerUp}
@@ -139,6 +197,7 @@ export default function MapViewer({
         >
           <div className="relative">
             <img
+              ref={imgRef}
               src={src}
               alt="Reference map"
               draggable={false}
@@ -149,6 +208,16 @@ export default function MapViewer({
               viewBox={`0 0 ${width || 1} ${height || 1}`}
               className="pointer-events-none absolute inset-0 h-full w-full"
             >
+              {region && (
+                <rect x={region.x} y={region.y} width={region.width} height={region.height}
+                      fill="#E57373" fillOpacity="0.12" stroke="#E57373"
+                      strokeWidth={stroke} strokeDasharray={`${stroke * 3} ${stroke * 2}`} />
+              )}
+              {drawRect && (
+                <rect x={drawRect.x} y={drawRect.y} width={drawRect.width} height={drawRect.height}
+                      fill="#E57373" fillOpacity="0.15" stroke="#E57373" strokeWidth={stroke} />
+              )}
+
               {layers.candidates &&
                 candidates.map((c) =>
                   c.tile ? (

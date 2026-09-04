@@ -14,6 +14,16 @@ from app.store import registry
 log = get_logger(__name__)
 router = APIRouter(prefix="/api", tags=["localization"])
 
+# Snapshot the plain (non-"efficient") keypoint-filtering defaults once at
+# import time, before any request can have mutated the shared `settings`
+# singleton - so a request with efficient_features=false always lands on the
+# documented factory defaults, never on whatever a previous request left.
+_DEFAULT_MAX_KEYPOINTS = settings.max_keypoints
+_DEFAULT_SP_DETECTION_THRESHOLD = settings.superpoint_detection_threshold
+_DEFAULT_SP_NMS_RADIUS = settings.superpoint_nms_radius
+_DEFAULT_SIFT_CONTRAST_THRESHOLD = settings.sift_contrast_threshold
+_DEFAULT_SIFT_EDGE_THRESHOLD = settings.sift_edge_threshold
+
 
 def _get_job(job_id: str):
     job = registry.get_job(job_id)
@@ -39,6 +49,14 @@ async def localize(req: LocalizeRequest) -> JobAccepted:
         raise HTTPException(status_code=400, detail=f"Unknown plan_id '{req.plan_id}'.")
 
     # Per-request overrides of the runtime matcher / rotation policy.
+    #
+    # NOTE: these two still mutate the shared `settings` singleton, which the
+    # pipeline reads back later from a background thread - a pre-existing
+    # race (a second overlapping request can change `settings.matcher` before
+    # the first request's job actually reads it) that predates this file's
+    # efficient_features/search_region additions. Left as-is here: fixing it
+    # requires the same explicit-parameter threading `feature_params` uses
+    # below, just for matcher/rotation_search too - a separate, focused change.
     if req.matcher:
         if req.matcher.lower() not in ("lightglue", "sift"):
             raise HTTPException(status_code=400,
@@ -47,7 +65,38 @@ async def localize(req: LocalizeRequest) -> JobAccepted:
     if req.rotation_search is not None:
         settings.rotation_search = bool(req.rotation_search)
 
-    job = start_job(req.map_id, req.drone_id, req.plan_id, req.top_k, req.calibration)
+    # Efficient-matching toggle: resolved to a concrete, explicit dict here
+    # and threaded through start_job -> localize as a plain parameter (never
+    # by mutating `settings`), so an overlapping request can never change
+    # this job's keypoint-strength config out from under it mid-flight.
+    if req.efficient_features:
+        feature_params = {
+            "max_keypoints": settings.efficient_max_keypoints,
+            "superpoint_detection_threshold": settings.efficient_superpoint_detection_threshold,
+            "superpoint_nms_radius": settings.efficient_superpoint_nms_radius,
+            "sift_contrast_threshold": settings.efficient_sift_contrast_threshold,
+            "sift_edge_threshold": settings.efficient_sift_edge_threshold,
+        }
+    else:
+        feature_params = {
+            "max_keypoints": _DEFAULT_MAX_KEYPOINTS,
+            "superpoint_detection_threshold": _DEFAULT_SP_DETECTION_THRESHOLD,
+            "superpoint_nms_radius": _DEFAULT_SP_NMS_RADIUS,
+            "sift_contrast_threshold": _DEFAULT_SIFT_CONTRAST_THRESHOLD,
+            "sift_edge_threshold": _DEFAULT_SIFT_EDGE_THRESHOLD,
+        }
+
+    search_region = None
+    if req.search_region:
+        try:
+            search_region = (float(req.search_region["x"]), float(req.search_region["y"]),
+                             float(req.search_region["width"]), float(req.search_region["height"]))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail="search_region must have numeric "
+                                "x, y, width, height.") from exc
+
+    job = start_job(req.map_id, req.drone_id, req.plan_id, req.top_k, req.calibration,
+                    search_region, feature_params)
     return JobAccepted(job_id=job.job_id, state=job.state,
                        poll_url=f"/api/process/{job.job_id}")
 

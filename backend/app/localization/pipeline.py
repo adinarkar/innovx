@@ -13,6 +13,7 @@ result leaves this module.
 """
 from __future__ import annotations
 
+import functools
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -24,7 +25,7 @@ import numpy as np
 from app.config import settings
 from app.logging_config import get_logger
 from app.localization import dino, homography as hg, visualization as viz
-from app.localization import semantic
+from app.localization import semantic, tiling
 from app.localization.domain_translation import get_translation_engine
 from app.localization.imaging import fit_long_edge, imread
 from app.localization.confidence import (CandidateScore, ClusterScore, ConsensusResult,
@@ -139,15 +140,18 @@ def _prepare_work_image(img: np.ndarray) -> Tuple[np.ndarray, float]:
 
 
 def _match_pair(query_img: np.ndarray, query_feats: FeatureSet,
-                target_img: np.ndarray) -> Tuple[MatchResult, FeatureSet]:
-    target_feats = extract_features(target_img)
+                target_img: np.ndarray,
+                extract_fn: Callable[[np.ndarray], FeatureSet] = extract_features
+                ) -> Tuple[MatchResult, FeatureSet]:
+    target_feats = extract_fn(target_img)
     result = match_features(query_feats, target_feats, query_img, target_img)
     return result, target_feats
 
 
 def _evaluate(query_img: np.ndarray, query_feats: FeatureSet,
               target_img: np.ndarray, rotation: int = 0,
-              canonical_size: Optional[Tuple[int, int]] = None
+              canonical_size: Optional[Tuple[int, int]] = None,
+              extract_fn: Callable[[np.ndarray], FeatureSet] = extract_features
               ) -> Tuple[hg.HomographyResult, MatchResult]:
     """
     Match then verify, always returning query points in the *canonical*
@@ -157,7 +161,7 @@ def _evaluate(query_img: np.ndarray, query_feats: FeatureSet,
     rotation search that is the rotated copy - while ``canonical_size`` is the
     unrotated ``(width, height)`` the points are mapped back into.
     """
-    match, _ = _match_pair(query_img, query_feats, target_img)
+    match, _ = _match_pair(query_img, query_feats, target_img, extract_fn)
     cw, ch = canonical_size or (query_img.shape[1], query_img.shape[0])
     if rotation:
         q_pts = unrotate_points(match.query_pts, rotation, cw, ch)
@@ -168,7 +172,9 @@ def _evaluate(query_img: np.ndarray, query_feats: FeatureSet,
 
 
 def _best_rotation(work_img: np.ndarray, query_feats: FeatureSet, tile_img: np.ndarray,
-                   work_w: int, work_h: int) -> Tuple[hg.HomographyResult, MatchResult, int]:
+                   work_w: int, work_h: int,
+                   extract_fn: Callable[[np.ndarray], FeatureSet] = extract_features
+                   ) -> Tuple[hg.HomographyResult, MatchResult, int]:
     """
     Evaluate a candidate tile at every orientation the query might be in and
     keep the strongest verified result (spec section 50).
@@ -179,7 +185,7 @@ def _best_rotation(work_img: np.ndarray, query_feats: FeatureSet, tile_img: np.n
     Ranked by (passed verification, inlier count) so a valid geometry always
     beats an invalid one regardless of raw inlier counts.
     """
-    hom0, match0 = _evaluate(work_img, query_feats, tile_img, rotation=0)
+    hom0, match0 = _evaluate(work_img, query_feats, tile_img, rotation=0, extract_fn=extract_fn)
     attempts = [(0, hom0, match0)]
 
     if settings.rotation_search:
@@ -188,9 +194,10 @@ def _best_rotation(work_img: np.ndarray, query_feats: FeatureSet, tile_img: np.n
         if needs_search:
             for k in (1, 2, 3):
                 rot_img = rotate_image(work_img, k)
-                rot_feats = extract_features(rot_img)
+                rot_feats = extract_fn(rot_img)
                 cand_hom, cand_match = _evaluate(rot_img, rot_feats, tile_img, rotation=k,
-                                                 canonical_size=(work_w, work_h))
+                                                 canonical_size=(work_w, work_h),
+                                                 extract_fn=extract_fn)
                 attempts.append((k, cand_hom, cand_match))
 
     def rank(attempt):
@@ -272,7 +279,9 @@ _RETRIEVAL_AUX_ORDER = ("map", "structural")
 
 def _multi_domain_retrieval(engine, record: MapRecord, rgb_embedding: np.ndarray,
                             representations: Dict[str, np.ndarray],
-                            primary_top_k: int) -> Tuple[List[dict], Dict[str, int]]:
+                            primary_top_k: int,
+                            tile_indices: Optional[np.ndarray] = None
+                            ) -> Tuple[List[dict], Dict[str, int]]:
     """
     Coarse candidate retrieval, optionally unioned across representations.
 
@@ -284,8 +293,22 @@ def _multi_domain_retrieval(engine, record: MapRecord, rgb_embedding: np.ndarray
     ``CANDIDATE_UNION_MAX``. Each surviving hit records which representations
     retrieved it and its best similarity, so downstream fusion can reward
     cross-domain agreement.
+
+    ``tile_indices``, when given (an operator-chosen search region), restricts
+    every retrieval bank to that subset of ``record.tiles``/``record.embeddings``
+    - hit indices are remapped back to the full tile list before returning, so
+    callers never need to know retrieval was narrowed.
     """
-    primary = dino.top_k(rgb_embedding, record.embeddings, primary_top_k)
+    bank = record.embeddings if tile_indices is None else record.embeddings[tile_indices]
+
+    def _remap(hits: List[dict]) -> List[dict]:
+        if tile_indices is None:
+            return hits
+        for h in hits:
+            h["index"] = int(tile_indices[h["index"]])
+        return hits
+
+    primary = _remap(dino.top_k(rgb_embedding, bank, primary_top_k))
     merged: Dict[int, dict] = {}
     for rank, hit in enumerate(primary):
         merged[hit["index"]] = {
@@ -302,7 +325,7 @@ def _multi_domain_retrieval(engine, record: MapRecord, rgb_embedding: np.ndarray
                 continue
             try:
                 emb = engine.embed(img)
-                hits = dino.top_k(emb, record.embeddings, settings.map_domain_top_k)
+                hits = _remap(dino.top_k(emb, bank, settings.map_domain_top_k))
             except Exception as exc:  # failure-safe: aux retrieval never blocks
                 log.warning("%s-domain retrieval failed (%s) - skipping.", name, exc)
                 continue
@@ -330,15 +353,40 @@ def _multi_domain_retrieval(engine, record: MapRecord, rgb_embedding: np.ndarray
 def localize(record: MapRecord, drone_path: Path, job_dir: Path,
              calibration: Optional[CameraCalibration] = None,
              progress: Optional[ProgressFn] = None,
-             top_k: Optional[int] = None) -> dict:
+             top_k: Optional[int] = None,
+             search_region: Optional[Tuple[float, float, float, float]] = None,
+             feature_params: Optional[Dict[str, float]] = None) -> dict:
     """
     Full localisation for one drone frame.  Always returns a structured result
     - including an explicit NO_MATCH - rather than raising for a poor match.
+
+    ``search_region``, when given, is a ``(x, y, width, height)`` map-pixel
+    rectangle that narrows retrieval to the tiles it intersects - see
+    ``tiling.tiles_in_region``. It never touches map indexing/caching, only
+    which already-embedded tiles this request considers.
+
+    ``feature_params``, when given, resolves the keypoint-strength config
+    (``max_keypoints``, ``superpoint_detection_threshold``,
+    ``superpoint_nms_radius``, ``sift_contrast_threshold``,
+    ``sift_edge_threshold``) for this job *once*, up front, and every
+    extraction call in this run uses that fixed snapshot via ``extract_fn``
+    - never the shared ``settings`` singleton, which a different,
+    concurrently-running request could mutate mid-flight (this is what backs
+    the frontend's Efficient Matching toggle).
     """
     progress = progress or _noop
     top_k = top_k or settings.top_k_candidates
     t_start = time.time()
     timings: Dict[str, float] = {}
+    fp = feature_params or {}
+    extract_fn = functools.partial(
+        extract_features,
+        max_keypoints=fp.get("max_keypoints"),
+        superpoint_detection_threshold=fp.get("superpoint_detection_threshold"),
+        superpoint_nms_radius=fp.get("superpoint_nms_radius"),
+        sift_contrast_threshold=fp.get("sift_contrast_threshold"),
+        sift_edge_threshold=fp.get("sift_edge_threshold"),
+    )
 
     def stage(key: str, label: str, state: str = "running", detail: Optional[str] = None):
         progress(key, label, state, detail)
@@ -384,23 +432,34 @@ def localize(record: MapRecord, drone_path: Path, job_dir: Path,
     timings["embed"] = time.time() - t0
     stage("embed", STAGES[2][1], "done", f"backend: {engine.backend}")
 
-    # ---- 4. retrieval (optionally multi-domain) ------------------------
+    # ---- 4. retrieval (optionally multi-domain / region-limited) --------
     stage(*STAGES[3])
     t0 = time.time()
+    tile_indices = None
+    region_note = ""
+    if search_region is not None:
+        tile_indices = tiling.tiles_in_region(record.tiles, search_region)
+        if tile_indices.size == 0:
+            log.warning("search_region matched no tiles for map %s - searching the full map.",
+                       record.map_id)
+            tile_indices = None
+        else:
+            region_note = f" (region-limited from {len(record.tiles)})"
     retrieved, retrieval_counts = _multi_domain_retrieval(
-        engine, record, query_embedding, representations, top_k)
+        engine, record, query_embedding, representations, top_k, tile_indices)
     timings["retrieve"] = time.time() - t0
+    searched = len(record.tiles) if tile_indices is None else len(tile_indices)
     if len(retrieval_counts) > 1:
-        detail = (f"{len(retrieved)} unioned of {len(record.tiles)} tiles ("
+        detail = (f"{len(retrieved)} unioned of {searched} tiles{region_note} ("
                   + ", ".join(f"{k}:{v}" for k, v in retrieval_counts.items()) + ")")
     else:
-        detail = f"top {len(retrieved)} of {len(record.tiles)} tiles"
+        detail = f"top {len(retrieved)} of {searched} tiles{region_note}"
     stage("retrieve", STAGES[3][1], "done", detail)
 
     # ---- 5. query features ----------------------------------------------
     stage(*STAGES[4])
     t0 = time.time()
-    query_feats = extract_features(work_img)
+    query_feats = extract_fn(work_img)
     timings["features"] = time.time() - t0
     stage("features", STAGES[4][1], "done",
           f"{query_feats.count} keypoints ({query_feats.backend})")
@@ -417,7 +476,7 @@ def localize(record: MapRecord, drone_path: Path, job_dir: Path,
         tile_img, tile_scale = _prepare_work_image(crop)
 
         hom, match, rotation_used = _best_rotation(work_img, query_feats, tile_img,
-                                                   work_w, work_h)
+                                                   work_w, work_h, extract_fn)
 
         score = evaluate_candidate(cand_idx + 1, tile.tile_id, hit["similarity"],
                                    hom, rotation_used)
@@ -446,7 +505,8 @@ def localize(record: MapRecord, drone_path: Path, job_dir: Path,
     t0 = time.time()
     verified = [e for e in evaluations if e.hom.ok and e.hom.plausible]
     if settings.global_fallback and not verified:
-        fallback = _global_fallback(map_img, work_img, query_feats, dw, dh, work_scale)
+        fallback = _global_fallback(map_img, work_img, query_feats, dw, dh, work_scale,
+                                    extract_fn)
         if fallback is not None:
             evaluations.append(fallback)
             log.info("Global fallback recovered a match with %d inliers.",
@@ -499,7 +559,7 @@ def localize(record: MapRecord, drone_path: Path, job_dir: Path,
     t0 = time.time()
     rep_scores, consensus = _cross_representation(
         representations, structural_obj, cluster_scores, best_cluster, best,
-        by_id, agg_center, same_place_px, work_w, work_h, dw, dh, stage)
+        by_id, agg_center, same_place_px, work_w, work_h, dw, dh, stage, extract_fn)
 
     # ---- cross-domain confidence fusion + verdict re-grade (spec Phase 8) --
     rgb_valid = bool(best_cluster.homography_valid) if best_cluster else False
@@ -548,7 +608,9 @@ def localize(record: MapRecord, drone_path: Path, job_dir: Path,
 # --------------------------------------------------------------------------
 def _global_fallback(map_img: np.ndarray, work_img: np.ndarray,
                      query_feats: FeatureSet, dw: int, dh: int,
-                     work_scale: float) -> Optional[CandidateEvaluation]:
+                     work_scale: float,
+                     extract_fn: Callable[[np.ndarray], FeatureSet] = extract_features
+                     ) -> Optional[CandidateEvaluation]:
     """
     Last resort: match the drone frame against the whole (downscaled) map.
 
@@ -557,7 +619,7 @@ def _global_fallback(map_img: np.ndarray, work_img: np.ndarray,
     exactly the same geometric gates as any tile candidate.
     """
     map_small, map_scale = fit_long_edge(map_img, max(settings.work_size * 2, 1280))
-    hom, match = _evaluate(work_img, query_feats, map_small, rotation=0)
+    hom, match = _evaluate(work_img, query_feats, map_small, rotation=0, extract_fn=extract_fn)
     if not (hom.ok and hom.plausible):
         return None
 
@@ -628,7 +690,8 @@ def _cross_representation(representations: Dict[str, np.ndarray], structural_obj
                          best: Optional["CandidateEvaluation"],
                          by_id: Dict[int, "CandidateEvaluation"],
                          agg_center: Optional[np.ndarray], same_place_px: float,
-                         work_w: int, work_h: int, dw: int, dh: int, stage
+                         work_w: int, work_h: int, dw: int, dh: int, stage,
+                         extract_fn: Callable[[np.ndarray], FeatureSet] = extract_features
                          ) -> Tuple[List[RepresentationScore], Optional[ConsensusResult]]:
     """
     Independently match the structural / map representations against the
@@ -656,7 +719,7 @@ def _cross_representation(representations: Dict[str, np.ndarray], structural_obj
         members = members[:max(1, settings.representation_matching_top_n)]
 
         estimates = _representation_estimates(representations, structural_obj, members,
-                                              work_w, work_h, dw, dh)
+                                              work_w, work_h, dw, dh, extract_fn)
 
         present = ["rgb"] + sorted(estimates) + ["retrieval"]
         weights = normalised_weights(present)
@@ -719,7 +782,8 @@ def _cross_representation(representations: Dict[str, np.ndarray], structural_obj
 
 def _match_one_representation(rep_work: np.ndarray, rep_feats: FeatureSet,
                               rep_scale: float, members: List["CandidateEvaluation"],
-                              work_w: int, work_h: int, dw: int, dh: int
+                              work_w: int, work_h: int, dw: int, dh: int,
+                              extract_fn: Callable[[np.ndarray], FeatureSet] = extract_features
                               ) -> Tuple[hg.HomographyResult, Optional[np.ndarray]]:
     """
     Match one representation's working image against each top candidate tile
@@ -738,14 +802,14 @@ def _match_one_representation(rep_work: np.ndarray, rep_feats: FeatureSet,
         if k:
             q_img = rotate_image(rep_work, k)
             try:
-                q_feats = extract_features(q_img)
+                q_feats = extract_fn(q_img)
             except Exception:
                 continue
             hom, _m = _evaluate(q_img, q_feats, ev.tile_image, rotation=k,
-                                canonical_size=(work_w, work_h))
+                                canonical_size=(work_w, work_h), extract_fn=extract_fn)
         else:
             hom, _m = _evaluate(rep_work, rep_feats, ev.tile_image, rotation=0,
-                                canonical_size=(work_w, work_h))
+                                canonical_size=(work_w, work_h), extract_fn=extract_fn)
         rank = (1 if (hom.ok and hom.plausible) else 0, hom.inliers)
         if rank <= best_rank:
             continue
@@ -762,7 +826,8 @@ def _match_one_representation(rep_work: np.ndarray, rep_feats: FeatureSet,
 
 def _representation_estimates(representations: Dict[str, np.ndarray],
                               structural_obj, members: List["CandidateEvaluation"],
-                              work_w: int, work_h: int, dw: int, dh: int
+                              work_w: int, work_h: int, dw: int, dh: int,
+                              extract_fn: Callable[[np.ndarray], FeatureSet] = extract_features
                               ) -> Dict[str, Tuple[hg.HomographyResult, Optional[np.ndarray]]]:
     """Independent structural / map-domain estimates for the winning location."""
     rep_imgs: Dict[str, np.ndarray] = {}
@@ -777,9 +842,9 @@ def _representation_estimates(representations: Dict[str, np.ndarray],
     for name, img in rep_imgs.items():
         try:
             rep_work, rep_scale = _prepare_work_image(img)
-            rep_feats = extract_features(rep_work)
+            rep_feats = extract_fn(rep_work)
             hom, center = _match_one_representation(rep_work, rep_feats, rep_scale,
-                                                   members, work_w, work_h, dw, dh)
+                                                   members, work_w, work_h, dw, dh, extract_fn)
             out[name] = (hom, center)
             log.info("Representation '%s': %d inliers, plausible=%s.",
                      name, hom.inliers, hom.ok and hom.plausible)

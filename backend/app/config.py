@@ -56,6 +56,22 @@ class Settings(BaseSettings):
     top_k_candidates: int = 8
     max_keypoints: int = 4096
     matcher: str = "lightglue"      # lightglue | sift
+    # Strength-based keypoint filtering, applied *before* the max_keypoints
+    # cap. Raising the detection/contrast threshold or the NMS radius keeps
+    # only more distinctive corners; these match today's library defaults so
+    # behaviour is unchanged unless overridden.
+    superpoint_detection_threshold: float = 0.0005
+    superpoint_nms_radius: int = 4
+    sift_contrast_threshold: float = 0.04
+    sift_edge_threshold: float = 10.0
+    # "Efficient matching" preset (spec: frontend toggle) - fewer, stronger
+    # keypoints, applied per-request via LocalizeRequest.efficient_features
+    # rather than as the standing default.
+    efficient_max_keypoints: int = 1500
+    efficient_superpoint_detection_threshold: float = 0.005
+    efficient_superpoint_nms_radius: int = 6
+    efficient_sift_contrast_threshold: float = 0.08
+    efficient_sift_edge_threshold: float = 8.0
 
     # --- geometric verification ---
     # Thresholds expressed in pixels scale with work_size (they are measured

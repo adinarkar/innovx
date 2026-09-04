@@ -44,16 +44,26 @@ class FeatureSet:
         }
 
 
-def extract(img: np.ndarray, max_keypoints: Optional[int] = None) -> Optional[FeatureSet]:
+def extract(img: np.ndarray, max_keypoints: Optional[int] = None,
+           detection_threshold: Optional[float] = None,
+           nms_radius: Optional[int] = None) -> Optional[FeatureSet]:
     """
     Run SuperPoint on a BGR image.  Returns ``None`` when the model is not
     installed so callers can fall back to SIFT.
+
+    ``max_keypoints``/``detection_threshold``/``nms_radius`` (default from
+    ``settings``) select which cached extractor instance is used - see
+    ``load_superpoint`` for why this has to be config-keyed rather than a
+    single global instance.
     """
-    extractor = load_superpoint()
+    max_keypoints = max_keypoints or settings.max_keypoints
+    detection_threshold = (settings.superpoint_detection_threshold
+                           if detection_threshold is None else detection_threshold)
+    nms_radius = settings.superpoint_nms_radius if nms_radius is None else nms_radius
+    extractor = load_superpoint(max_keypoints, detection_threshold, nms_radius)
     if extractor is None:
         return None
     torch = try_import_torch()
-    max_keypoints = max_keypoints or settings.max_keypoints
     device = resolve_device()
 
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0

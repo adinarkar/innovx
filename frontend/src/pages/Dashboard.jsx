@@ -7,6 +7,8 @@ import GeoreferencePanel from '../components/GeoreferencePanel'
 import MissionPanel from '../components/MissionPanel'
 import TechnicalDetails from '../components/TechnicalDetails'
 import CandidateCard from '../components/CandidateCard'
+import RunHistory from '../components/RunHistory'
+import MapViewer from '../components/MapViewer'
 import { Chip } from '../components/Badge'
 import { useApp } from '../hooks/useAppState'
 import { apiUrl } from '../services/api'
@@ -21,6 +23,9 @@ export default function Dashboard() {
   } = useApp()
   const navigate = useNavigate()
   const [selectedCandidate, setSelectedCandidate] = useState(null)
+  const [efficient, setEfficient] = useState(false)
+  const [regionMode, setRegionMode] = useState(false)
+  const [region, setRegion] = useState(null)
 
   const indexing = mapInfo?.embedding_status === 'indexing'
   const candidates = result?.candidates || []
@@ -79,7 +84,15 @@ export default function Dashboard() {
         <div className="flex flex-wrap items-center justify-between gap-3">
           <h2 className="text-sm font-semibold tracking-tight text-ink">Input Data</h2>
           {(mapInfo || droneInfo || planInfo) && (
-            <button type="button" className="btn-ghost !py-1.5 text-[12px]" onClick={reset}>
+            <button
+              type="button"
+              className="btn-ghost !py-1.5 text-[12px]"
+              onClick={() => {
+                reset()
+                setRegion(null)
+                setRegionMode(false)
+              }}
+            >
               Clear session
             </button>
           )}
@@ -138,12 +151,63 @@ export default function Dashboard() {
           />
         </div>
 
+        {mapInfo && (
+          <div className="space-y-2">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <h3 className="text-[13px] font-medium text-ink">Search Region (optional)</h3>
+                <p className="text-[12px] text-ink-muted">
+                  Draw a rectangle to restrict retrieval to part of the map instead of searching
+                  it all — faster, and useful when you already know the rough area.
+                </p>
+              </div>
+              <div className="flex items-center gap-2">
+                {region && (
+                  <button type="button" className="btn-ghost !py-1.5 text-[12px]"
+                          onClick={() => setRegion(null)}>
+                    Clear region
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={() => setRegionMode((m) => !m)}
+                  className={`chip cursor-pointer ${
+                    regionMode ? 'bg-brand text-white' : 'bg-white text-ink-muted ring-1 ring-ink-line hover:bg-brand-bg'
+                  }`}
+                >
+                  {regionMode ? 'Drawing — drag on the map' : 'Select search area'}
+                </button>
+              </div>
+            </div>
+            <MapViewer
+              src={apiUrl(mapInfo.preview_url)}
+              width={mapInfo.width}
+              height={mapInfo.height}
+              regionMode={regionMode}
+              region={region}
+              onRegionChange={setRegion}
+              viewportClass="h-[300px]"
+              caption={region
+                ? `Region-limited: ${Math.round(region.width)} × ${Math.round(region.height)} px at (${Math.round(region.x)}, ${Math.round(region.y)}).`
+                : 'Whole map will be searched.'}
+            />
+          </div>
+        )}
+
         <div className="flex flex-col items-center gap-3 pt-1">
+          <label className="flex cursor-pointer items-center gap-2 text-[12.5px] font-medium text-ink-soft">
+            <input type="checkbox" checked={efficient} onChange={(e) => setEfficient(e.target.checked)}
+                   className="h-4 w-4 accent-[#E57373]" />
+            Efficient matching — fewer, stronger features (faster, less noisy)
+          </label>
           <button
             type="button"
             className="btn-primary w-full max-w-md !py-3 text-[15px]"
             disabled={!ready || busy}
-            onClick={() => runLocalization()}
+            onClick={() => runLocalization({
+              efficient_features: efficient,
+              search_region: region || undefined,
+            })}
           >
             {busy ? (
               <>
@@ -204,6 +268,8 @@ export default function Dashboard() {
           </section>
         </>
       )}
+
+      <RunHistory />
 
       <div className="grid gap-4 lg:grid-cols-2">
         <GeoreferencePanel />

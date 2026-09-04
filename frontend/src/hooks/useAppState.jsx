@@ -12,6 +12,28 @@ const AppContext = createContext(null)
 
 const POLL_MS = 700
 const SESSION_KEY = 'innovx.visualnav.session'
+const HISTORY_KEY = 'innovx.visualnav.history'
+const HISTORY_LIMIT = 8
+
+/** Run history (for the Run Comparison table) survives a refresh the same
+ * way the session mirror does, but in its own key - it grows/shrinks on a
+ * different rhythm (one entry per completed run) than the upload mirror. */
+const readHistory = () => {
+  try {
+    const parsed = JSON.parse(sessionStorage.getItem(HISTORY_KEY) || '[]')
+    return Array.isArray(parsed) ? parsed : []
+  } catch {
+    return []
+  }
+}
+
+const writeHistory = (entries) => {
+  try {
+    sessionStorage.setItem(HISTORY_KEY, JSON.stringify(entries))
+  } catch {
+    /* private browsing or a full quota - persistence is best-effort */
+  }
+}
 
 /**
  * The uploaded assets and the last job id are mirrored into sessionStorage so
@@ -46,6 +68,7 @@ export function AppProvider({ children }) {
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState(null)
   const [backendUp, setBackendUp] = useState(null)
+  const [history, setHistory] = useState(readHistory)
   const pollRef = useRef(null)
 
   // ---- backend info ----------------------------------------------------
@@ -176,6 +199,28 @@ export function AppProvider({ children }) {
     }
   }, [])
 
+  const recordHistory = useCallback((jobId, options, result) => {
+    setHistory((prev) => {
+      const entry = {
+        id: jobId,
+        ranAt: Date.now(),
+        options,
+        status: result.status,
+        confidence: result.confidence,
+        processingTime: result.processing_time,
+        bestCandidate: result.best_candidate ?? null,
+      }
+      const next = [entry, ...prev].slice(0, HISTORY_LIMIT)
+      writeHistory(next)
+      return next
+    })
+  }, [])
+
+  const clearHistory = useCallback(() => {
+    setHistory([])
+    writeHistory([])
+  }, [])
+
   const runLocalization = useCallback(
     async (options = {}) => {
       if (!mapInfo?.map_id || !droneInfo?.drone_id) {
@@ -203,6 +248,7 @@ export function AppProvider({ children }) {
               if (status.state === 'done') {
                 setResult(status.result)
                 setBusy(false)
+                if (status.result) recordHistory(accepted.job_id, options, status.result)
                 resolve(status.result)
                 return
               }
@@ -227,7 +273,7 @@ export function AppProvider({ children }) {
         return null
       }
     },
-    [mapInfo?.map_id, droneInfo?.drone_id, planInfo?.plan_id, stopPolling],
+    [mapInfo?.map_id, droneInfo?.drone_id, planInfo?.plan_id, stopPolling, recordHistory],
   )
 
   useEffect(() => stopPolling, [stopPolling])
@@ -269,11 +315,13 @@ export function AppProvider({ children }) {
       clearGeoreference,
       runLocalization,
       reset,
+      history,
+      clearHistory,
     }),
     [
       system, backendUp, refreshSystem, mapInfo, droneInfo, planInfo, job, result,
       busy, error, ready, uploadMap, uploadDrone, uploadPlan, applyGeoreference,
-      clearGeoreference, runLocalization, reset,
+      clearGeoreference, runLocalization, reset, history, clearHistory,
     ],
   )
 

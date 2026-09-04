@@ -139,8 +139,21 @@ def load_dinov2():
 # --------------------------------------------------------------------------
 # SuperPoint + LightGlue
 # --------------------------------------------------------------------------
-def load_superpoint():
-    key = "superpoint"
+def load_superpoint(max_num_keypoints: Optional[int] = None,
+                    detection_threshold: Optional[float] = None,
+                    nms_radius: Optional[int] = None):
+    """
+    Load (or reuse) a SuperPoint extractor for a given keypoint-strength
+    config. Cached *per config*, not as one global singleton - otherwise a
+    runtime override (e.g. the efficient-matching toggle) would silently have
+    no effect after the first call, since the cap and NMS radius are baked
+    into the extractor at construction time.
+    """
+    max_num_keypoints = max_num_keypoints or settings.max_keypoints
+    detection_threshold = (settings.superpoint_detection_threshold
+                           if detection_threshold is None else detection_threshold)
+    nms_radius = settings.superpoint_nms_radius if nms_radius is None else nms_radius
+    key = f"superpoint:{max_num_keypoints}:{detection_threshold}:{nms_radius}"
     with _LOCK:
         if key in _CACHE:
             return _CACHE[key]
@@ -153,10 +166,13 @@ def load_superpoint():
         try:
             from lightglue import SuperPoint
 
-            extractor = SuperPoint(max_num_keypoints=settings.max_keypoints)
+            extractor = SuperPoint(max_num_keypoints=max_num_keypoints,
+                                   detection_threshold=detection_threshold,
+                                   nms_radius=nms_radius)
             extractor = extractor.eval().to(resolve_device())
             _CACHE[key] = extractor
-            log.info("SuperPoint ready (max_num_keypoints=%d).", settings.max_keypoints)
+            log.info("SuperPoint ready (max_num_keypoints=%d, detection_threshold=%s, "
+                     "nms_radius=%d).", max_num_keypoints, detection_threshold, nms_radius)
             return extractor
         except Exception as exc:
             _FAILED[key] = str(exc)
@@ -202,7 +218,9 @@ def probe_capabilities(warm: bool = False) -> Capabilities:
         caps.lightglue = load_lightglue() is not None
     else:
         caps.dinov2 = "dinov2" in _CACHE
-        caps.superpoint = "superpoint" in _CACHE
+        # superpoint is cached per keypoint-strength config (see
+        # load_superpoint), not under one fixed key.
+        caps.superpoint = any(k.startswith("superpoint:") for k in _CACHE)
         caps.lightglue = "lightglue" in _CACHE
     if not caps.torch:
         caps.notes.append(

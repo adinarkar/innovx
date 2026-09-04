@@ -146,15 +146,19 @@ def register_drone(file: UploadFile) -> DroneRecord:
 # --------------------------------------------------------------------------
 def start_job(map_id: str, drone_id: str, plan_id: Optional[str] = None,
               top_k: Optional[int] = None,
-              calibration: Optional[dict] = None) -> JobRecord:
+              calibration: Optional[dict] = None,
+              search_region: Optional[tuple] = None,
+              feature_params: Optional[dict] = None) -> JobRecord:
     """Create and enqueue a localisation job."""
     job = JobRecord(job_id=new_id("job"), map_id=map_id, drone_id=drone_id, plan_id=plan_id)
     registry.add_job(job)
-    EXECUTOR.submit(_run_job, job, top_k, calibration)
+    EXECUTOR.submit(_run_job, job, top_k, calibration, search_region, feature_params)
     return job
 
 
-def _run_job(job: JobRecord, top_k: Optional[int], calibration: Optional[dict]) -> None:
+def _run_job(job: JobRecord, top_k: Optional[int], calibration: Optional[dict],
+            search_region: Optional[tuple] = None,
+            feature_params: Optional[dict] = None) -> None:
     job.state = "running"
     map_rec = registry.get_map(job.map_id)
     drone_rec = registry.get_drone(job.drone_id)
@@ -170,7 +174,8 @@ def _run_job(job: JobRecord, top_k: Optional[int], calibration: Optional[dict]) 
 
         result = localize(map_rec, drone_rec.path, job.job_dir,
                           calibration=CameraCalibration.from_dict(calibration),
-                          progress=progress, top_k=top_k)
+                          progress=progress, top_k=top_k, search_region=search_region,
+                          feature_params=feature_params)
         result["mode"] = settings.app_mode
         if settings.app_mode == "demo":
             result["mode_warning"] = ("DEMO MODE - these figures come from the demo "

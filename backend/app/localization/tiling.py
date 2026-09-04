@@ -111,6 +111,25 @@ def tile_to_map(tile: Tile, pts: np.ndarray, tile_render_scale: float) -> np.nda
     return out
 
 
+def tiles_in_region(tiles: List[Tile],
+                    region: Tuple[float, float, float, float]) -> np.ndarray:
+    """
+    Indices of ``tiles`` whose box intersects ``(x, y, width, height)`` (map
+    pixels). Used to restrict retrieval to an operator-chosen sub-area of the
+    map instead of searching the whole thing - purely a request-time filter,
+    the underlying tile/embedding cache is untouched.
+
+    Returns an empty array if nothing intersects; callers should treat that
+    as "region unusable" and fall back to the full tile set rather than fail
+    the request (spec: optional features are never fatal).
+    """
+    rx, ry, rw, rh = region
+    rx2, ry2 = rx + rw, ry + rh
+    idx = [i for i, t in enumerate(tiles)
+           if t.x < rx2 and t.x + t.width > rx and t.y < ry2 and t.y + t.height > ry]
+    return np.array(idx, dtype=int)
+
+
 def map_bounds_of(tiles: List[Tile]) -> Tuple[int, int, int, int]:
     xs = [t.x for t in tiles] + [t.x + t.width for t in tiles]
     ys = [t.y for t in tiles] + [t.y + t.height for t in tiles]

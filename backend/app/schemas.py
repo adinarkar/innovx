@@ -97,6 +97,13 @@ class LocalizeRequest(BaseModel):
     rotation_search: Optional[bool] = None
     calibration: Optional[Dict[str, float]] = Field(
         None, description="Optional fx, fy, cx, cy, k1, k2, p1, p2, k3")
+    efficient_features: Optional[bool] = Field(
+        None, description="true: keep only fewer, stronger keypoints (faster, "
+                          "less noisy matching). false/omitted: today's defaults.")
+    search_region: Optional[Dict[str, float]] = Field(
+        None, description="Optional map-pixel rectangle {x, y, width, height} - "
+                          "restricts retrieval to tiles intersecting this area "
+                          "instead of searching the whole map.")
 
 
 class JobAccepted(BaseModel):

@@ -622,6 +622,11 @@ All settings are environment variables with defaults — see `.env.example`.
 | `TOP_K_CANDIDATES` | `8` | Candidates carried into verification |
 | `MAX_KEYPOINTS` | `4096` | Per-image feature budget |
 | `MATCHER` | `lightglue` | `lightglue` or `sift` |
+| `SUPERPOINT_DETECTION_THRESHOLD` | `0.0005` | Corners below this score are discarded before the `MAX_KEYPOINTS` cap |
+| `SUPERPOINT_NMS_RADIUS` | `4` | Suppression radius between kept corners |
+| `SIFT_CONTRAST_THRESHOLD` | `0.04` | Low-contrast SIFT features discarded before ranking |
+| `SIFT_EDGE_THRESHOLD` | `10.0` | Edge-like (less distinctive) SIFT features discarded before ranking |
+| `EFFICIENT_MAX_KEYPOINTS` / `EFFICIENT_SUPERPOINT_DETECTION_THRESHOLD` / `EFFICIENT_SUPERPOINT_NMS_RADIUS` / `EFFICIENT_SIFT_CONTRAST_THRESHOLD` / `EFFICIENT_SIFT_EDGE_THRESHOLD` | `1500` / `0.005` / `6` / `0.08` / `8.0` | "Efficient matching" preset - fewer, stronger keypoints. Applied per-request via the frontend's Efficient Matching toggle (`LocalizeRequest.efficient_features`), never as a standing default |
 | `TILE_SCALES` | `0.08…0.25` | Tile areas as a fraction of map area |
 | `TILE_OVERLAP` | `0.35` | Overlap between neighbouring tiles |
 | `MAX_TILES` | `900` | Tile budget; the grid is evenly subsampled beyond it |
